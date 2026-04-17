@@ -1,0 +1,5 @@
+httpx
+python-telegram-bot
+sqlalchemy
+pydantic
+python-dotenv

@@ -1,0 +1,42 @@
+# Credentials & secrets - NEVER commit these
+credentials.env
+*.env
+.env
+*.key
+*.pem
+
+# Database (contains live trade data, rebuild locally)
+*.db
+*.sqlite
+
+# Python
+venv/
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Scratch / debug files
+check_positions.py
+test_deribit.py
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE
+.vscode/
+.idea/
+*.code-workspace
+
+# Logs
+*.log
+
+# Conductor internal
+conductor/.cache/

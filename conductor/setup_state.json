@@ -1,0 +1,42 @@
+{
+  "status": "complete",
+  "project_type": "brownfield",
+  "current_section": "styleguides",
+  "current_question": 2,
+  "completed_sections": ["product", "guidelines", "tech_stack", "workflow", "styleguides"],
+  "answers": {
+    "project_name": "BTC Options Playbook",
+    "project_description": "An institutional-grade toolkit for managing BTC collateral through automated ratio spreads and convex hedging.",
+    "problem_statement": "Existing portfolio trackers are USD-centric and fail to properly model BTC-denominated collateral constraints and inverse payouts. Furthermore, managing complex ratio spreads like AIRS manually introduces emotional friction, requires constant monitoring, and leads to calculation errors during extreme volatility.",
+    "target_users": "Solo algorithmic/systematic traders running inverse options strategies on Deribit.",
+    "key_goals": [
+      "Grow BTC stack count regardless of USD price.",
+      "Generate sustainable premium rent.",
+      "Ensure zero liquidation risk (survive 50% crash or 100% surge)."
+    ],
+    "voice_and_tone": "Professional, technical, concise, and direct.",
+    "design_principles": "Clarity over complexity (Focus on critical metrics like Margin % and Liquidation distance).",
+    "primary_languages": "TypeScript, Python",
+    "frontend_framework": "Telegram Bot Interface (Python-based, stateless polling)",
+    "backend_framework": "FastAPI / standalone scheduler for CRON jobs",
+    "database": "SQLite (Focus on DVOL historical tracking and custom Trade ID mappings)",
+    "infrastructure": "Cloud (Render/Railway/Heroku for lightweight Python bot)",
+    "tdd_strictness": "Moderate - tests highly encouraged, but not blocking for simple features.",
+    "commit_strategy": "Conventional Commits (feat:, fix:, etc.)",
+    "code_review_requirements": "Required for non-trivial changes (e.g. core math, backend logic)",
+    "verification_checkpoints": "After each phase completion",
+    "languages_to_include": "TypeScript, Python"
+  },
+  "files_created": [
+    "conductor/index.md",
+    "conductor/product.md",
+    "conductor/product-guidelines.md",
+    "conductor/tech-stack.md",
+    "conductor/workflow.md",
+    "conductor/tracks.md",
+    "conductor/code_styleguides/typescript.md",
+    "conductor/code_styleguides/python.md"
+  ],
+  "started_at": "2026-04-17T04:37:30Z",
+  "last_updated": "2026-04-17T07:25:20Z"
+}
