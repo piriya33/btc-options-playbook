@@ -23,6 +23,7 @@ from database.queries import (
     untag_instrument,
     get_morning_push_chat_id,
     set_morning_push_chat_id,
+    get_all_open_campaigns,
 )
 
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
@@ -59,6 +60,71 @@ def _build_airs_trades(suggestion: dict) -> list:
         {"instr": suggestion["leg_a"], "amount": round(0.5 * scale, 1), "side": "sell", "role": "yield_call"},
         {"instr": suggestion["leg_b"], "amount": round(0.2 * scale, 1), "side": "sell", "role": "yield_put"},
     ]
+
+
+# ── Campaign slot definitions ──────────────────────────────────────────────────
+# Three time-staggered slots; together they give ~1.0× equity exposure across 3 campaigns
+CAMPAIGN_SLOTS = [
+    {"number": 1, "label": "Harvest", "dte_min": 20, "dte_max": 45, "target_dte": 35},
+    {"number": 2, "label": "Core",    "dte_min": 46, "dte_max": 65, "target_dte": 55},
+    {"number": 3, "label": "Far",     "dte_min": 66, "dte_max": 90, "target_dte": 75},
+]
+
+
+def _instr_dte(instrument_name: str) -> int | None:
+    """Parse DTE from a Deribit instrument name, e.g. BTC-29MAY26-92000-C."""
+    parts = instrument_name.split("-")
+    if len(parts) == 4:
+        try:
+            expiry = datetime.strptime(parts[1], "%d%b%y")
+            return (expiry - datetime.now(UTC).replace(tzinfo=None)).days
+        except Exception:
+            pass
+    return None
+
+
+def _instr_campaign_name(instrument_name: str) -> str:
+    """Derive a campaign name from an instrument expiry, e.g. 'MAY2026'."""
+    parts = instrument_name.split("-")
+    if len(parts) == 4:
+        try:
+            expiry = datetime.strptime(parts[1], "%d%b%y")
+            return expiry.strftime("%b%Y").upper()
+        except Exception:
+            pass
+    return f"AIRS-{datetime.now(UTC).strftime('%b%Y').upper()}"
+
+
+def _slot_for_dte(dte: int | None) -> int | None:
+    """Return which slot number (1/2/3) a given DTE falls into, or None."""
+    if dte is None:
+        return None
+    for slot in CAMPAIGN_SLOTS:
+        if slot["dte_min"] <= dte <= slot["dte_max"]:
+            return slot["number"]
+    return None
+
+
+def _filled_slots(campaigns: list) -> dict:
+    """
+    Return {slot_number: {"name": ..., "dte": ...}} for each open campaign
+    that maps to a recognised slot.
+    """
+    filled = {}
+    for c in campaigns:
+        dte = None
+        for spread in c.get("spreads", []):
+            for leg in spread.get("legs", []):
+                dte = _instr_dte(leg["instrument_name"])
+                if dte is not None:
+                    break
+            if dte is not None:
+                break
+        slot_num = _slot_for_dte(dte)
+        if slot_num and slot_num not in filled:
+            filled[slot_num] = {"name": c["name"], "dte": dte}
+    return filled
+
 
 # ── Shared report helper ───────────────────────────────────────────────────────
 async def _fetch_data():
@@ -367,45 +433,114 @@ async def close_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def suggest_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Searching for the best instruments (30-45 DTE)... 🔍")
+    await update.message.reply_text("Analysing campaign slots and finding best instruments... 🔍")
     try:
-        leg_a = await deribit_client.find_instruments_by_delta(-0.10, 35, 'C')
-        leg_b = await deribit_client.find_instruments_by_delta(-0.10, 35, 'P')
-        leg_c = await deribit_client.find_instruments_by_delta(0.03, 35, 'P')
-        leg_d = await deribit_client.find_instruments_by_delta(0.02, 35, 'C')
-
         await deribit_client.authenticate()
         summary = await deribit_client.get_account_summary()
         equity  = summary.get("equity", 0)
-        scale   = max(0.5, round(equity * 0.5, 1))
+
+        # ── Determine which slot to fill ──────────────────────────────────────
+        existing  = get_all_open_campaigns()
+        filled    = _filled_slots(existing)
+
+        open_slot = next((s for s in CAMPAIGN_SLOTS if s["number"] not in filled), None)
+
+        if open_slot is None:
+            slot_lines = "\n".join(
+                f"  Slot {s['number']} – {s['label']}: ✅ {filled[s['number']]['name']} ({filled[s['number']]['dte']} DTE)"
+                for s in CAMPAIGN_SLOTS
+            )
+            await update.message.reply_text(
+                f"✅ *All 3 campaign slots are active:*\n{slot_lines}\n\n"
+                "_No new campaign needed. Monitor existing positions with /status._",
+                parse_mode='Markdown'
+            )
+            return
+
+        target_dte = open_slot["target_dte"]
+
+        # ── Find legs at the right DTE ────────────────────────────────────────
+        leg_a = await deribit_client.find_instruments_by_delta(-0.10, target_dte, 'C')
+        leg_b = await deribit_client.find_instruments_by_delta(-0.10, target_dte, 'P')
+        leg_c = await deribit_client.find_instruments_by_delta(0.03,  target_dte, 'P')
+        leg_d = await deribit_client.find_instruments_by_delta(0.02,  target_dte, 'C')
+
+        # ── Sizing: equity / 3 per campaign ──────────────────────────────────
+        scale = round(equity / 3, 1)
+
+        # Leg sizes at the AIRS ratios
+        sz_a = round(0.5 * scale, 1)
+        sz_b = round(0.2 * scale, 1)
+        sz_c = round(0.6 * scale, 1)
+        sz_d = round(1.0 * scale, 1)
+
+        # ── Net premium breakdown ─────────────────────────────────────────────
+        call_credit = sz_a * leg_a[0]['bid'] - sz_d * leg_d[0]['ask']
+        put_credit  = sz_b * leg_b[0]['bid'] - sz_c * leg_c[0]['ask']
+        total_credit = call_credit + put_credit
+
+        def _fmt_credit(val: float) -> str:
+            sign = "+" if val >= 0 else ""
+            emoji = "✅" if val >= 0 else "⚠️"
+            return f"{sign}{round(val, 5)} BTC {emoji}"
+
+        # ── Slot status lines ─────────────────────────────────────────────────
+        slot_lines = []
+        for s in CAMPAIGN_SLOTS:
+            if s["number"] in filled:
+                info = filled[s["number"]]
+                slot_lines.append(f"  Slot {s['number']} – {s['label']}: ✅ {info['name']} ({info['dte']} DTE)")
+            elif s["number"] == open_slot["number"]:
+                slot_lines.append(f"  Slot {s['number']} – {s['label']}: 👉 *Suggesting now*")
+            else:
+                slot_lines.append(f"  Slot {s['number']} – {s['label']}: ⬜ Empty")
 
         report = [
-            "🚀 *New AIRS Suggestion (35 DTE Target)*",
-            f"\n💰 *Account Equity:* {round(equity, 4)} BTC",
-            f"⚖️ *Suggested Scale:* {scale} (per campaign, target 3 active)",
+            f"🚀 *AIRS Suggestion — Slot {open_slot['number']}: {open_slot['label']}*",
+            f"Target: ~{target_dte} DTE\n",
+            "*Campaign Slots:*",
+            *slot_lines,
+            f"\n💰 Equity: {round(equity, 4)} BTC",
+            f"⚖️ Campaign allocation: {scale} BTC (equity ÷ 3)",
             "\n*Yield Legs (Short):*",
             f"• A (Call): {leg_a[0]['instrument']} (Δ: {round(leg_a[0]['delta'], 2)})",
-            f"  └ Size: {round(0.5 * scale, 1)} BTC | Bid: {leg_a[0]['bid']} | Ask: {leg_a[0]['ask']}",
-            f"• B (Put): {leg_b[0]['instrument']} (Δ: {round(leg_b[0]['delta'], 2)})",
-            f"  └ Size: {round(0.2 * scale, 1)} BTC | Bid: {leg_b[0]['bid']} | Ask: {leg_b[0]['ask']}",
+            f"  └ Size: {sz_a} | Bid: {leg_a[0]['bid']} | Ask: {leg_a[0]['ask']}",
+            f"• B (Put):  {leg_b[0]['instrument']} (Δ: {round(leg_b[0]['delta'], 2)})",
+            f"  └ Size: {sz_b} | Bid: {leg_b[0]['bid']} | Ask: {leg_b[0]['ask']}",
             "\n*Hedge Legs (Long):*",
             f"• C (Crash): {leg_c[0]['instrument']} (Δ: {round(leg_c[0]['delta'], 2)})",
-            f"  └ Size: {round(0.6 * scale, 1)} BTC | Bid: {leg_c[0]['bid']} | Ask: {leg_c[0]['ask']}",
-            f"• D (Moon): {leg_d[0]['instrument']} (Δ: {round(leg_d[0]['delta'], 2)})",
-            f"  └ Size: {round(1.0 * scale, 1)} BTC | Bid: {leg_d[0]['bid']} | Ask: {leg_d[0]['ask']}",
-            "\n_Click below to open all legs at suggested sizes._"
+            f"  └ Size: {sz_c} | Bid: {leg_c[0]['bid']} | Ask: {leg_c[0]['ask']}",
+            f"• D (Moon):  {leg_d[0]['instrument']} (Δ: {round(leg_d[0]['delta'], 2)})",
+            f"  └ Size: {sz_d} | Bid: {leg_d[0]['bid']} | Ask: {leg_d[0]['ask']}",
+            "\n*Net Premium at Mid:*",
+            f"  📞 Call spread (A−D): {_fmt_credit(call_credit)}",
+            f"  📉 Put spread  (B−C): {_fmt_credit(put_credit)}",
+            f"  ──────────────────────",
+            f"  Total: {_fmt_credit(total_credit)}",
         ]
+
+        if total_credit < 0:
+            report.append("\n❌ *Net DEBIT — do not initiate. Adjust strikes or sizing.*")
+        else:
+            report.append("\n_Pre-flight check runs before any order is placed._")
 
         context.user_data["last_suggestion"] = {
             "leg_a": leg_a[0]['instrument'],
             "leg_b": leg_b[0]['instrument'],
             "leg_c": leg_c[0]['instrument'],
             "leg_d": leg_d[0]['instrument'],
-            "scale": scale
+            "scale": scale,
+            "slot":  open_slot,
         }
 
-        keyboard = [[InlineKeyboardButton("🚀 Initiate Full AIRS Campaign", callback_data="init_airs")]]
-        await update.message.reply_text("\n".join(report), parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(keyboard))
+        keyboard = [[InlineKeyboardButton(
+            f"🚀 Initiate Slot {open_slot['number']} – {open_slot['label']}",
+            callback_data="init_airs"
+        )]]
+        await update.message.reply_text(
+            "\n".join(report), parse_mode='Markdown',
+            reply_markup=InlineKeyboardMarkup(keyboard) if total_credit >= 0 else None
+        )
     except Exception as e:
         logger.error(f"Error finding suggestions: {e}")
         await update.message.reply_text(f"❌ Error finding suggestions: {e}")
@@ -458,7 +593,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.user_data["pending_airs"] = {
                 "trades": trades,
                 "exec_prices": exec_prices,
-                "campaign": f"AIRS-{datetime.now(UTC).strftime('%b%Y').upper()}",
+                "campaign": _instr_campaign_name(trades[0]["instr"]),
             }
 
             if has_no_market:
