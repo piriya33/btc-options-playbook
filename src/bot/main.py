@@ -18,10 +18,10 @@ from database.session import init_db
 from database.queries import (
     get_iv_rank_30d,
     get_initial_btc_equity,
-    add_instrument_to_group,
-    remove_instrument_from_group,
+    tag_instrument,
+    untag_instrument,
     get_morning_push_chat_id,
-    set_morning_push_chat_id
+    set_morning_push_chat_id,
 )
 
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
@@ -129,8 +129,13 @@ async def _check_alerts(context: ContextTypes.DEFAULT_TYPE):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     await update.message.reply_html(
-        rf"Hi {user.mention_html()}! I am AIRY, your AIRS playbook bot. "
-        "Commands: /morning /status /suggest /iv /fear_greed /buy /sell /close /group /ungroup /register"
+        rf"Hi {user.mention_html()}! I am AIRY, your AIRS playbook bot.<br/>"
+        "<b>Market:</b> /morning /status /suggest /iv /fear_greed<br/>"
+        "<b>Trading:</b> /buy /sell /close<br/>"
+        "<b>Tagging:</b> /tag &lt;instrument&gt; &lt;role&gt; &lt;campaign&gt; | /untag &lt;instrument&gt;<br/>"
+        "  Roles: A=yield_call  B=yield_put  C=crash_hedge  D=moon_hedge<br/>"
+        "  Example: <code>/tag BTC-27JUN25-100000-C A MAY-2026</code><br/>"
+        "<b>Settings:</b> /register"
     )
 
 
@@ -221,27 +226,38 @@ async def fear_greed_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ Error fetching Fear & Greed: {e}")
 
 
-async def group_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def tag_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /tag <instrument> <role> <campaign>
+    role: A/B/C/D  or  yield_call/yield_put/crash_hedge/moon_hedge
+    campaign: e.g. MAY-2026
+    """
     args = context.args
-    if len(args) != 2:
-        await update.message.reply_text("Usage: /group <TradeID> <instrument>")
+    if len(args) != 3:
+        await update.message.reply_text(
+            "Usage: /tag <instrument> <role> <campaign>\n"
+            "Roles: A=yield_call  B=yield_put  C=crash_hedge  D=moon_hedge\n"
+            "Example: /tag BTC-27JUN25-100000-C A MAY-2026"
+        )
         return
-    trade_id, instrument = args
-    if add_instrument_to_group(trade_id, instrument):
-        await update.message.reply_text(f"✅ Grouped {instrument} → {trade_id}.")
-    else:
-        await update.message.reply_text("❌ Failed to group instrument.")
+    instrument, role_input, campaign = args
+    ok, msg = tag_instrument(instrument, role_input, campaign)
+    prefix = "✅" if ok else "❌"
+    await update.message.reply_text(f"{prefix} {msg}", parse_mode='Markdown')
 
 
-async def ungroup_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def untag_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /untag <instrument>
+    Removes the instrument from its campaign/spread.
+    """
     args = context.args
     if len(args) != 1:
-        await update.message.reply_text("Usage: /ungroup <instrument>")
+        await update.message.reply_text("Usage: /untag <instrument>")
         return
-    if remove_instrument_from_group(args[0]):
-        await update.message.reply_text(f"✅ Ungrouped {args[0]}.")
-    else:
-        await update.message.reply_text("❌ Instrument not found in any group.")
+    ok, msg = untag_instrument(args[0])
+    prefix = "✅" if ok else "❌"
+    await update.message.reply_text(f"{prefix} {msg}")
 
 
 async def register(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -374,10 +390,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             scale = suggestion.get("scale", 1.0)
             await deribit_client.authenticate()
             trades = [
-                {"instr": suggestion["leg_d"], "amount": round(1.0 * scale, 1), "side": "buy"},
-                {"instr": suggestion["leg_c"], "amount": round(0.6 * scale, 1), "side": "buy"},
-                {"instr": suggestion["leg_a"], "amount": round(0.5 * scale, 1), "side": "sell"},
-                {"instr": suggestion["leg_b"], "amount": round(0.2 * scale, 1), "side": "sell"},
+                {"instr": suggestion["leg_d"], "amount": round(1.0 * scale, 1), "side": "buy",  "role": "moon_hedge"},
+                {"instr": suggestion["leg_c"], "amount": round(0.6 * scale, 1), "side": "buy",  "role": "crash_hedge"},
+                {"instr": suggestion["leg_a"], "amount": round(0.5 * scale, 1), "side": "sell", "role": "yield_call"},
+                {"instr": suggestion["leg_b"], "amount": round(0.2 * scale, 1), "side": "sell", "role": "yield_put"},
             ]
 
             async def execute_leg(t):
@@ -390,19 +406,24 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         price = ticker.get("best_bid_price") or ticker.get("last_price")
                         res = await deribit_client.sell(t["instr"], t["amount"], price=price, order_type="limit")
                     order = res.get("order", {})
-                    return {"instr": t["instr"], "status": "✅", "id": order.get("order_id"), "price": order.get("average_price", 0)}
+                    return {"instr": t["instr"], "status": "✅", "id": order.get("order_id"),
+                            "price": order.get("average_price", 0), "role": t["role"]}
                 except Exception as e:
-                    return {"instr": t["instr"], "status": "❌", "error": str(e)}
+                    return {"instr": t["instr"], "status": "❌", "error": str(e), "role": t["role"]}
 
             results = await asyncio.gather(*(execute_leg(t) for t in trades))
-            trade_id = f"AIRS-{datetime.now(UTC).strftime('%m%d-%H%M')}"
-            summary = [f"🚀 *AIRS Campaign ({trade_id})*\n"]
+            campaign_name = f"AIRS-{datetime.now(UTC).strftime('%b%Y').upper()}"
+            summary = [f"🚀 *AIRS Campaign ({campaign_name})*\n"]
             for r in results:
                 if r["status"] == "✅":
                     summary.append(f"✅ {r['instr']}\n  └ Price: {r['price']} | ID: {r['id']}")
-                    add_instrument_to_group(trade_id, r["instr"])
+                    # Auto-tag: map instrument back to its role
+                    role = r.get("role", "")
+                    if role:
+                        tag_instrument(r["instr"], role, campaign_name)
                 else:
                     summary.append(f"❌ {r['instr']}\n  └ {r['error']}")
+            summary.append(f"\n_Use /tag to re-assign legs or add to a different campaign._")
             await query.edit_message_text("\n".join(summary), parse_mode='Markdown')
         except Exception as e:
             await query.edit_message_text(f"❌ Critical error: {e}")
@@ -512,8 +533,8 @@ def main():
     application.add_handler(CommandHandler("start",      start))
     application.add_handler(CommandHandler("morning",    morning))
     application.add_handler(CommandHandler("status",     status))
-    application.add_handler(CommandHandler("group",      group_cmd))
-    application.add_handler(CommandHandler("ungroup",    ungroup_cmd))
+    application.add_handler(CommandHandler("tag",        tag_cmd))
+    application.add_handler(CommandHandler("untag",      untag_cmd))
     application.add_handler(CommandHandler("register",   register))
     application.add_handler(CommandHandler("buy",        trade_cmd))
     application.add_handler(CommandHandler("sell",       trade_cmd))
