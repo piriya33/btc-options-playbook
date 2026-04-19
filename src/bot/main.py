@@ -21,9 +21,13 @@ from database.queries import (
     get_initial_btc_equity,
     tag_instrument,
     untag_instrument,
+    close_leg,
+    get_leg_info,
     get_morning_push_chat_id,
     set_morning_push_chat_id,
     get_all_open_campaigns,
+    list_legs_for_campaign,
+    get_legs_for_spread,
 )
 
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
@@ -37,6 +41,10 @@ MARGIN_WARN_PCT    = 25.0   # blueprint hard limit — log a warning
 MARGIN_ALERT_PCT   = 40.0   # critical — send Telegram alert
 SPREAD_WARN_PCT    = 25.0   # bid/ask spread as % of mid — warn user
 SPREAD_BLOCK_PCT   = 80.0   # bid/ask spread — block execution (no real market)
+HARVEST_TARGET_PCT = 50.0   # alert when short leg profit >= this % of entry credit
+
+# Track harvest alerts sent this session — prevents re-alerting every 15 min
+_harvest_alerted: set = set()
 
 
 def _assess_spread(ticker: dict) -> dict:
@@ -126,6 +134,57 @@ def _filled_slots(campaigns: list) -> dict:
     return filled
 
 
+# ── Market Readiness Score ─────────────────────────────────────────────────────
+
+async def _market_readiness_score(iv_rank: float, margin_pct: float) -> dict:
+    """
+    Composite gate for /suggest.
+    Levels: GO 🟢 / CAUTION 🟡 / AVOID 🔴
+    Block triggers  → AVOID:   IV rank < 20  or margin > MARGIN_WARN_PCT
+    Warn triggers   → CAUTION: IV rank > 80  or spot 24h move > 10%
+    """
+    level = "GO"
+    reasons: list[str] = []
+    spot_move_24h: float | None = None
+
+    # Fetch 24-hour spot move from CoinGecko (non-fatal if unavailable)
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            r = await client.get(
+                "https://api.coingecko.com/api/v3/simple/price",
+                params={"ids": "bitcoin", "vs_currencies": "usd", "include_24hr_change": "true"},
+            )
+        cg = r.json().get("bitcoin", {})
+        spot_move_24h = abs(cg.get("usd_24h_change", 0.0))
+    except Exception:
+        pass  # non-fatal — we just won't check this signal
+
+    # ── Block conditions ──────────────────────────────────────────────────────
+    if iv_rank < 20:
+        level = "AVOID"
+        reasons.append(f"IV Rank {iv_rank:.1f}% < 20% — volatility too cheap to sell")
+    if margin_pct > MARGIN_WARN_PCT:
+        level = "AVOID"
+        reasons.append(f"Margin {margin_pct:.1f}% > {MARGIN_WARN_PCT:.0f}% — no capacity for new positions")
+
+    # ── Warn conditions (only upgrade to CAUTION if not already blocked) ──────
+    if level != "AVOID":
+        if iv_rank > 80:
+            level = "CAUTION"
+            reasons.append(f"IV Rank {iv_rank:.1f}% > 80% — elevated vol, risk of crush after entry")
+        if spot_move_24h is not None and spot_move_24h > 10:
+            level = "CAUTION"
+            reasons.append(f"Spot moved {spot_move_24h:.1f}% in 24h — high intraday volatility")
+
+    emoji = {"GO": "🟢", "CAUTION": "🟡", "AVOID": "🔴"}[level]
+    return {
+        "level":          level,
+        "emoji":          emoji,
+        "reasons":        reasons,
+        "spot_move_24h":  spot_move_24h,
+    }
+
+
 # ── Shared report helper ───────────────────────────────────────────────────────
 async def _fetch_data():
     await deribit_client.authenticate()
@@ -192,27 +251,69 @@ async def _check_alerts(context: ContextTypes.DEFAULT_TYPE):
                 parse_mode='Markdown'
             )
 
-        # Delta drift per group
-        grouped = {}
+        # ── Delta drift per campaign ───────────────────────────────────────────
+        grouped: dict = {}
         for d in directives:
-            gid = d.get("group_id", "Unassigned")
-            grouped.setdefault(gid, []).append(d)
+            cam = d.get("campaign_name", "Untagged")
+            grouped.setdefault(cam, []).append(d)
 
-        for gid, items in grouped.items():
+        for cam, items in grouped.items():
             total_delta = sum(d.get("raw_delta", 0) for d in items)
             if abs(total_delta) > DELTA_DRIFT_LIMIT:
                 keyboard = [[
-                    InlineKeyboardButton("⚖️ Adjust Hedge",  callback_data=f"alert_hedge:{gid}"),
-                    InlineKeyboardButton("❌ Close Yield",   callback_data=f"alert_close_yield:{gid}"),
+                    InlineKeyboardButton("⚖️ Adjust Hedge", callback_data=f"alert_hedge:{cam}"),
+                    InlineKeyboardButton("❌ Close Yield",  callback_data=f"alert_close_yield:{cam}"),
                 ]]
                 await context.bot.send_message(
                     chat_id=chat_id,
-                    text=(f"⚠️ *DELTA DRIFT — {gid}*\n"
+                    text=(f"⚠️ *DELTA DRIFT — {cam}*\n"
                           f"Combined Δ: *{round(total_delta, 3)}* (Limit: ±{DELTA_DRIFT_LIMIT})\n"
                           f"Consider adjusting your hedge legs."),
                     parse_mode='Markdown',
                     reply_markup=InlineKeyboardMarkup(keyboard)
                 )
+
+        # ── Harvest alerts — 50% profit target ────────────────────────────────
+        for pos in positions:
+            if pos.get("size", 0) >= 0:
+                continue  # only short legs
+            instr = pos["instrument_name"]
+            leg_info = get_leg_info(instr)
+            if leg_info.get("role") not in ("yield_call", "yield_put"):
+                continue
+            if instr in _harvest_alerted:
+                continue  # already alerted this session
+
+            entry_credit = abs(pos.get("average_price", 0))
+            floating_pnl = pos.get("floating_profit_loss", 0)
+            if entry_credit <= 0:
+                continue
+
+            # floating_pnl is positive when short is profitable (option decayed)
+            profit_pct = (floating_pnl / (entry_credit * abs(pos["size"]))) * 100 if entry_credit > 0 else 0
+
+            if profit_pct >= HARVEST_TARGET_PCT:
+                _harvest_alerted.add(instr)
+                role_label = ROLE_LABELS.get(leg_info.get("role", ""), "")
+                campaign   = leg_info.get("campaign_name", "unknown")
+                spread_id  = leg_info.get("spread_id")
+                keyboard = [[
+                    InlineKeyboardButton("✂️ Close this leg",    callback_data=f"close:{instr}"),
+                    InlineKeyboardButton("✂️ Close whole spread", callback_data=f"close_spread:{spread_id}"),
+                    InlineKeyboardButton("🎈 Leave it",           callback_data="noop"),
+                ]]
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=(f"🎯 *Harvest Target Reached*\n"
+                          f"*{instr}* [{role_label}] in *{campaign}*\n"
+                          f"Profit: *{profit_pct:.0f}%* of entry credit\n"
+                          f"  Entry credit: {entry_credit:.5f} BTC/contract\n"
+                          f"  Floating PnL: +{round(floating_pnl, 5)} BTC\n"
+                          f"  → Close now to lock in profit, or leave it running."),
+                    parse_mode='Markdown',
+                    reply_markup=InlineKeyboardMarkup(keyboard)
+                )
+
     except Exception as e:
         logger.error(f"Alert check failed: {e}")
 
@@ -224,9 +325,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         rf"Hi {user.mention_html()}! I am AIRY, your AIRS playbook bot.<br/>"
         "<b>Market:</b> /morning /status /suggest /iv /fear_greed<br/>"
         "<b>Trading:</b> /buy /sell /close<br/>"
+        "<b>Campaigns:</b> /campaigns /legs<br/>"
         "<b>Tagging:</b> /tag &lt;instrument&gt; &lt;role&gt; &lt;campaign&gt; | /untag &lt;instrument&gt;<br/>"
         "  Roles: A=yield_call  B=yield_put  C=crash_hedge  D=moon_hedge<br/>"
-        "  Example: <code>/tag BTC-27JUN25-100000-C A MAY-2026</code><br/>"
+        "  Example: <code>/tag BTC-27JUN25-100000-C A MAY2026</code><br/>"
         "<b>Settings:</b> /register"
     )
 
@@ -364,6 +466,48 @@ async def untag_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"{prefix} {msg}")
 
 
+async def campaigns_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show all open campaigns with spread structure and realized PnL."""
+    campaigns = get_all_open_campaigns()
+    if not campaigns:
+        await update.message.reply_text(
+            "No open campaigns. Use /suggest to find instruments, then /tag to assign them."
+        )
+        return
+    lines = ["📋 *Open Campaigns*\n"]
+    for c in campaigns:
+        total_legs = sum(len(s["legs"]) for s in c["spreads"])
+        lines.append(f"*{c['name']}*  ({total_legs} legs tagged)")
+        lines.append(f"  Realized PnL: {c['realized_pnl']:+.5f} BTC")
+        for s in c["spreads"]:
+            label = "📞 Call Spread" if s["spread_type"] == "call_spread" else "📉 Put Spread"
+            strikes = ", ".join(l["instrument_name"].split("-")[2] for l in s["legs"])
+            lines.append(f"  {label}: {strikes or '—'}")
+        lines.append("")
+    lines.append("_Use /legs for full instrument details._")
+    await update.message.reply_text("\n".join(lines), parse_mode='Markdown')
+
+
+async def legs_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """List all tagged legs grouped by campaign and spread."""
+    campaigns = get_all_open_campaigns()
+    if not campaigns:
+        await update.message.reply_text(
+            "No tagged legs. Use /tag <instrument> <role> <campaign> to assign positions."
+        )
+        return
+    lines = ["🏷️ *Tagged Legs*\n"]
+    for c in campaigns:
+        lines.append(f"*{c['name']}*")
+        for s in c["spreads"]:
+            label = "📞 Call Spread (A+D)" if s["spread_type"] == "call_spread" else "📉 Put Spread (B+C)"
+            lines.append(f"  {label}")
+            for leg in s["legs"]:
+                role_label = ROLE_LABELS.get(leg["role"], leg["role"])
+                lines.append(f"    [{role_label}]  {leg['instrument_name']}")
+    await update.message.reply_text("\n".join(lines), parse_mode='Markdown')
+
+
 async def register(update: Update, context: ContextTypes.DEFAULT_TYPE):
     set_morning_push_chat_id(update.effective_chat.id)
     await update.message.reply_text("✅ Registered! Daily Morning Briefing at 08:00 UTC.")
@@ -418,6 +562,7 @@ async def close_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not pos:
             await update.message.reply_text(f"❌ No open position for {instrument}")
             return
+        realized_pnl = pos.get("floating_profit_loss", 0)
         size = pos["size"]
         ticker = await deribit_client.get_ticker(instrument)
         if size > 0:
@@ -427,7 +572,16 @@ async def close_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             price = ticker.get("best_ask_price") or ticker.get("last_price")
             res = await deribit_client.buy(instrument, abs(size), price=price, order_type="limit")
         order = res.get("order", {})
-        await update.message.reply_text(f"✅ Closed! ID: {order.get('order_id')}")
+
+        # Record realized PnL if this leg is tagged
+        pnl_msg = ""
+        ok, msg = close_leg(instrument, realized_pnl)
+        if ok:
+            pnl_msg = f"\nRealized PnL: {realized_pnl:+.5f} BTC (recorded)"
+        elif "not tagged" not in msg:
+            pnl_msg = f"\n⚠️ PnL not recorded: {msg}"
+
+        await update.message.reply_text(f"✅ Closed! ID: {order.get('order_id')}{pnl_msg}")
     except Exception as e:
         await update.message.reply_text(f"❌ Error: {e}")
 
@@ -436,8 +590,26 @@ async def suggest_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Analysing campaign slots and finding best instruments... 🔍")
     try:
         await deribit_client.authenticate()
-        summary = await deribit_client.get_account_summary()
-        equity  = summary.get("equity", 0)
+        summary    = await deribit_client.get_account_summary()
+        equity     = summary.get("equity", 0)
+        margin_pct = (summary.get("initial_margin", 0) / equity * 100) if equity > 0 else 0
+
+        # ── Market Readiness Score ────────────────────────────────────────────
+        current_dvol = await deribit_client.get_dvol()
+        iv_data      = get_iv_rank_30d(current_dvol)
+        readiness    = await _market_readiness_score(iv_data["rank"], margin_pct)
+
+        if readiness["level"] == "AVOID":
+            lines = [
+                f"{readiness['emoji']} *Market Readiness: AVOID*",
+                "",
+                "New AIRS campaign blocked — fix the following:",
+            ]
+            for r in readiness["reasons"]:
+                lines.append(f"  ❌ {r}")
+            lines.append("\n_Check again with /suggest once conditions improve._")
+            await update.message.reply_text("\n".join(lines), parse_mode='Markdown')
+            return
 
         # ── Determine which slot to fill ──────────────────────────────────────
         existing  = get_all_open_campaigns()
@@ -519,10 +691,21 @@ async def suggest_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"  Total: {_fmt_credit(total_credit)}",
         ]
 
+        # ── Readiness block ───────────────────────────────────────────────────
+        report.append(f"\n*Market Readiness: {readiness['emoji']} {readiness['level']}*")
+        if readiness["reasons"]:
+            for r in readiness["reasons"]:
+                report.append(f"  ⚠️ {r}")
+        if readiness["spot_move_24h"] is not None:
+            report.append(f"  24h spot move: {readiness['spot_move_24h']:.1f}%")
+
         if total_credit < 0:
             report.append("\n❌ *Net DEBIT — do not initiate. Adjust strikes or sizing.*")
         else:
-            report.append("\n_Pre-flight check runs before any order is placed._")
+            if readiness["level"] == "CAUTION":
+                report.append("\n⚠️ *Proceed with caution.* Pre-flight check runs before any order is placed.")
+            else:
+                report.append("\n_Pre-flight check runs before any order is placed._")
 
         context.user_data["last_suggestion"] = {
             "leg_a": leg_a[0]['instrument'],
@@ -715,13 +898,15 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             results = []
             for pos in short_legs:
-                instr = pos["instrument_name"]
-                size  = pos["size"]
+                instr        = pos["instrument_name"]
+                size         = pos["size"]
+                realized_pnl = pos.get("floating_profit_loss", 0)
                 try:
                     ticker = await deribit_client.get_ticker(instr)
                     price  = ticker.get("best_ask_price") or ticker.get("last_price")
                     res    = await deribit_client.buy(instr, abs(size), price=price, order_type="limit")
-                    results.append(f"✅ Closed {instr}")
+                    close_leg(instr, realized_pnl)
+                    results.append(f"✅ Closed {instr}  PnL: {realized_pnl:+.5f} BTC")
                 except Exception as e:
                     results.append(f"❌ {instr}: {e}")
 
@@ -753,6 +938,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if not pos:
                 await query.edit_message_text(f"❌ No open position for {instrument}")
                 return
+            realized_pnl = pos.get("floating_profit_loss", 0)
             size = pos["size"]
             ticker = await deribit_client.get_ticker(instrument)
             if size > 0:
@@ -762,9 +948,65 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 price = ticker.get("best_ask_price") or ticker.get("last_price")
                 res = await deribit_client.buy(instrument, abs(size), price=price, order_type="limit")
             order = res.get("order", {})
-            await query.edit_message_text(f"✅ Closed {instrument}!\nOrder ID: {order.get('order_id')}")
+
+            pnl_msg = ""
+            ok, msg = close_leg(instrument, realized_pnl)
+            if ok:
+                pnl_msg = f"\nRealized PnL: {realized_pnl:+.5f} BTC (recorded)"
+
+            await query.edit_message_text(
+                f"✅ Closed {instrument}!\nOrder ID: {order.get('order_id')}{pnl_msg}"
+            )
         except Exception as e:
             await query.edit_message_text(f"❌ Error closing {instrument}: {e}")
+        return
+
+    if data.startswith("close_spread:"):
+        spread_id = int(data.split(":", 1)[1])
+        await query.edit_message_text(f"⏳ Closing all legs in spread {spread_id}...")
+        try:
+            await deribit_client.authenticate()
+            legs     = get_legs_for_spread(spread_id)
+            positions = await deribit_client.get_open_positions()
+            pos_map  = {p["instrument_name"]: p for p in positions}
+
+            results = []
+            for leg in legs:
+                instr = leg["instrument_name"]
+                pos   = pos_map.get(instr)
+                if not pos:
+                    results.append(f"ℹ️ {instr}: no open position")
+                    continue
+                realized_pnl = pos.get("floating_profit_loss", 0)
+                size = pos["size"]
+                try:
+                    ticker = await deribit_client.get_ticker(instr)
+                    if size > 0:
+                        price = ticker.get("best_bid_price") or ticker.get("last_price")
+                        await deribit_client.sell(instr, abs(size), price=price, order_type="limit")
+                    else:
+                        price = ticker.get("best_ask_price") or ticker.get("last_price")
+                        await deribit_client.buy(instr, abs(size), price=price, order_type="limit")
+                    close_leg(instr, realized_pnl)
+                    role_label = ROLE_LABELS.get(leg["role"], leg["role"])
+                    results.append(f"✅ [{role_label}] {instr}  PnL: {realized_pnl:+.5f} BTC")
+                except Exception as e:
+                    results.append(f"❌ {instr}: {e}")
+
+            await query.edit_message_text(
+                "✂️ *Spread Closed*\n\n" + "\n".join(results),
+                parse_mode='Markdown'
+            )
+        except Exception as e:
+            await query.edit_message_text(f"❌ Error closing spread: {e}")
+        return
+
+    if data == "noop":
+        # Harvest alert acknowledged — do nothing (alert already sent)
+        await query.edit_message_text(
+            query.message.text + "\n\n_Acknowledged — leaving it to run._",
+            parse_mode='Markdown'
+        )
         return
 
     if data.startswith("alert_hedge:") or data.startswith("alert_close_yield:"):
@@ -809,6 +1051,8 @@ def main():
     application.add_handler(CommandHandler("status",     status))
     application.add_handler(CommandHandler("tag",        tag_cmd))
     application.add_handler(CommandHandler("untag",      untag_cmd))
+    application.add_handler(CommandHandler("campaigns",  campaigns_cmd))
+    application.add_handler(CommandHandler("legs",       legs_cmd))
     application.add_handler(CommandHandler("register",   register))
     application.add_handler(CommandHandler("buy",        trade_cmd))
     application.add_handler(CommandHandler("sell",       trade_cmd))

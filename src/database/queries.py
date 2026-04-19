@@ -167,6 +167,50 @@ def get_leg_info(instrument_name: str) -> dict:
         db.close()
 
 
+def close_leg(instrument_name: str, realized_pnl_btc: float) -> tuple:
+    """
+    Record that a leg was closed. Propagates realized PnL to the parent Spread
+    and Campaign. Does NOT delete the leg — keeps history.
+    Returns (success: bool, message: str).
+    """
+    db = SessionLocal()
+    try:
+        leg = db.query(TradeLeg).filter(TradeLeg.instrument_name == instrument_name).first()
+        if not leg:
+            return False, f"{instrument_name} is not tagged — PnL not recorded."
+        leg.realized_pnl          += realized_pnl_btc
+        leg.spread.realized_pnl   += realized_pnl_btc
+        leg.spread.campaign.realized_pnl += realized_pnl_btc
+        db.commit()
+        return True, f"Recorded {realized_pnl_btc:+.5f} BTC realized PnL for {instrument_name}."
+    except Exception as e:
+        db.rollback()
+        return False, f"DB error recording PnL: {e}"
+    finally:
+        db.close()
+
+
+def list_legs_for_campaign(campaign_name: str) -> list:
+    """Returns all legs for a campaign as plain dicts, ordered by spread then role."""
+    db = SessionLocal()
+    try:
+        campaign = db.query(Campaign).filter(Campaign.name == campaign_name).first()
+        if not campaign:
+            return []
+        result = []
+        for spread in campaign.spreads:
+            for leg in spread.legs:
+                result.append({
+                    "instrument_name": leg.instrument_name,
+                    "role":            leg.role,
+                    "spread_type":     spread.spread_type,
+                    "realized_pnl":    leg.realized_pnl,
+                })
+        return result
+    finally:
+        db.close()
+
+
 def get_all_open_campaigns() -> list:
     """Returns all open campaigns as plain dicts (safe outside DB session)."""
     db = SessionLocal()
@@ -215,5 +259,20 @@ def get_realized_pnl_for_campaign(campaign_name: str) -> float:
     try:
         campaign = db.query(Campaign).filter(Campaign.name == campaign_name).first()
         return campaign.realized_pnl if campaign else 0.0
+    finally:
+        db.close()
+
+
+def get_legs_for_spread(spread_id: int) -> list:
+    """Returns all legs for a given spread as plain dicts (safe outside DB session)."""
+    db = SessionLocal()
+    try:
+        spread = db.query(Spread).filter(Spread.id == spread_id).first()
+        if not spread:
+            return []
+        return [
+            {"instrument_name": leg.instrument_name, "role": leg.role}
+            for leg in spread.legs
+        ]
     finally:
         db.close()
