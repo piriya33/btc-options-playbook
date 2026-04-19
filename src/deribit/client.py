@@ -19,6 +19,12 @@ class DeribitClient:
         await self._client.aclose()
 
     async def authenticate(self):
+        # Read lazily so load_dotenv() called in main() is respected even though
+        # DeribitClient is instantiated at module level (before load_dotenv runs).
+        if not self.client_id:
+            self.client_id = os.getenv("DERIBIT_API_KEY")
+        if not self.client_secret:
+            self.client_secret = os.getenv("DERIBIT_SECRET_KEY")
         if not self.client_id or not self.client_secret:
             raise ValueError("Deribit API credentials not found in environment.")
 

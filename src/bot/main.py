@@ -147,20 +147,32 @@ async def morning(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Generating live status... ⏳")
-    report, markup = await _get_report()
-    await update.message.reply_text(report, parse_mode='Markdown', reply_markup=markup)
-
     try:
-        spot_price, positions, _, _, _ = await _fetch_data()
+        spot_price, positions, account_summary, iv_data, initial_equity = await _fetch_data()
+        analyzer = AIRSAnalyzer(spot_price, positions, account_summary, iv_data, initial_equity)
+        data = analyzer.get_report_data()
+
+        keyboard = []
+        for d in data["directives"]:
+            instr = d.get("instrument")
+            if not instr:
+                continue
+            label = instr.split('-')[-2]
+            row = [InlineKeyboardButton(f"❌ Close {label}", callback_data=f"close:{instr}")]
+            if d.get("status") == "ROLL":
+                row.append(InlineKeyboardButton(f"🔄 Roll {label}", callback_data=f"roll:{instr}"))
+            keyboard.append(row)
+        keyboard.append([InlineKeyboardButton("🎯 Take Free Options", callback_data="take_free")])
+        markup = InlineKeyboardMarkup(keyboard) if keyboard else None
+
+        await update.message.reply_text(data["text"], parse_mode='Markdown', reply_markup=markup)
+
         if positions:
             buf = generate_payoff_chart(positions, spot_price)
-            await update.message.reply_photo(
-                photo=buf,
-                caption="📈 P&L at Expiry — Current Portfolio"
-            )
+            await update.message.reply_photo(photo=buf, caption="📈 P&L at Expiry — Current Portfolio")
     except Exception as e:
-        logger.error(f"Payoff chart error: {e}")
-        await update.message.reply_text(f"⚠️ Could not generate payoff chart: {e}")
+        logger.error(f"Status error: {e}", exc_info=True)
+        await update.message.reply_text(f"⚠️ Error generating status: {e}")
 
 
 async def iv_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
