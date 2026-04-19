@@ -13,6 +13,7 @@ from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, Callb
 from deribit.client import DeribitClient
 from analyzer.logic import AIRSAnalyzer
 from analyzer.charts import generate_payoff_chart
+from database.models import ROLE_LABELS
 
 from database.session import init_db
 from database.queries import (
@@ -30,9 +31,34 @@ logger = logging.getLogger(__name__)
 deribit_client = DeribitClient(testnet=True)
 
 # ── Constants ──────────────────────────────────────────────────────────────────
-DELTA_DRIFT_LIMIT = 0.15
-MARGIN_WARN_PCT   = 25.0   # blueprint hard limit — log a warning
-MARGIN_ALERT_PCT  = 40.0   # critical — send Telegram alert
+DELTA_DRIFT_LIMIT  = 0.15
+MARGIN_WARN_PCT    = 25.0   # blueprint hard limit — log a warning
+MARGIN_ALERT_PCT   = 40.0   # critical — send Telegram alert
+SPREAD_WARN_PCT    = 25.0   # bid/ask spread as % of mid — warn user
+SPREAD_BLOCK_PCT   = 80.0   # bid/ask spread — block execution (no real market)
+
+
+def _assess_spread(ticker: dict) -> dict:
+    """Return spread quality info for a ticker. Quality: ✅ good / ⚠️ wide / ❌ no market."""
+    bid = ticker.get("best_bid_price") or 0.0
+    ask = ticker.get("best_ask_price") or 0.0
+    if bid <= 0 or ask <= 0:
+        return {"bid": bid, "ask": ask, "mid": 0.0, "spread_pct": float("inf"), "quality": "❌"}
+    mid = (bid + ask) / 2
+    spread_pct = (ask - bid) / mid * 100
+    quality = "✅" if spread_pct < SPREAD_WARN_PCT else ("⚠️" if spread_pct < SPREAD_BLOCK_PCT else "❌")
+    return {"bid": bid, "ask": ask, "mid": round(mid, 6), "spread_pct": round(spread_pct, 1), "quality": quality}
+
+
+def _build_airs_trades(suggestion: dict) -> list:
+    """Return the 4-leg trade list from a /suggest suggestion dict."""
+    scale = suggestion.get("scale", 1.0)
+    return [
+        {"instr": suggestion["leg_d"], "amount": round(1.0 * scale, 1), "side": "buy",  "role": "moon_hedge"},
+        {"instr": suggestion["leg_c"], "amount": round(0.6 * scale, 1), "side": "buy",  "role": "crash_hedge"},
+        {"instr": suggestion["leg_a"], "amount": round(0.5 * scale, 1), "side": "sell", "role": "yield_call"},
+        {"instr": suggestion["leg_b"], "amount": round(0.2 * scale, 1), "side": "sell", "role": "yield_put"},
+    ]
 
 # ── Shared report helper ───────────────────────────────────────────────────────
 async def _fetch_data():
@@ -392,53 +418,154 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = query.data
 
     if data == "init_airs":
+        # ── Step 1: Pre-flight spread check ───────────────────────────────────
         suggestion = context.user_data.get("last_suggestion")
         if not suggestion:
             await query.edit_message_text("❌ Suggestion expired. Run /suggest again.")
             return
 
-        await query.edit_message_text("⏳ Executing 4-Leg AIRS Initiation in Parallel...")
+        await query.edit_message_text("🔍 Running pre-flight spread check...")
         try:
-            scale = suggestion.get("scale", 1.0)
             await deribit_client.authenticate()
-            trades = [
-                {"instr": suggestion["leg_d"], "amount": round(1.0 * scale, 1), "side": "buy",  "role": "moon_hedge"},
-                {"instr": suggestion["leg_c"], "amount": round(0.6 * scale, 1), "side": "buy",  "role": "crash_hedge"},
-                {"instr": suggestion["leg_a"], "amount": round(0.5 * scale, 1), "side": "sell", "role": "yield_call"},
-                {"instr": suggestion["leg_b"], "amount": round(0.2 * scale, 1), "side": "sell", "role": "yield_put"},
-            ]
+            trades = _build_airs_trades(suggestion)
 
-            async def execute_leg(t):
+            lines = ["📋 *Pre-flight Check*\n"]
+            has_no_market = False
+            has_wide = False
+            tickers = {}
+            exec_prices = {}
+
+            for t in trades:
+                ticker = await deribit_client.get_ticker(t["instr"])
+                tickers[t["instr"]] = ticker
+                s = _assess_spread(ticker)
+                exec_price = (ticker.get("best_ask_price") if t["side"] == "buy"
+                              else ticker.get("best_bid_price")) or ticker.get("last_price", 0)
+                exec_prices[t["instr"]] = exec_price
+                role_label = ROLE_LABELS.get(t["role"], t["role"])
+
+                lines.append(
+                    f"{s['quality']} *[{role_label}]* {t['instr']}\n"
+                    f"  Bid: {s['bid']} | Ask: {s['ask']} | Spread: {s['spread_pct']}%\n"
+                    f"  Exec: {exec_price} BTC × {t['amount']} contracts"
+                )
+                if s["quality"] == "❌":
+                    has_no_market = True
+                elif s["quality"] == "⚠️":
+                    has_wide = True
+
+            # Store the resolved trade plan for the confirm step
+            context.user_data["pending_airs"] = {
+                "trades": trades,
+                "exec_prices": exec_prices,
+                "campaign": f"AIRS-{datetime.now(UTC).strftime('%b%Y').upper()}",
+            }
+
+            if has_no_market:
+                lines.append(
+                    "\n❌ *One or more legs have no active market.*\n"
+                    "_This is common on testnet. Try placing orders manually via /buy and /sell._"
+                )
+                keyboard = [[InlineKeyboardButton("❌ Cancel", callback_data="init_airs_cancel")]]
+            else:
+                if has_wide:
+                    lines.append("\n⚠️ *Wide spreads detected — fills may be poor.*")
+                else:
+                    lines.append("\n✅ *Spreads look good.*")
+                lines.append("_Legs execute sequentially. If any leg fails, filled legs are rolled back._")
+                keyboard = [[
+                    InlineKeyboardButton("🚀 Confirm", callback_data="init_airs_confirm"),
+                    InlineKeyboardButton("❌ Cancel",  callback_data="init_airs_cancel"),
+                ]]
+
+            await query.edit_message_text(
+                "\n".join(lines), parse_mode='Markdown',
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+        except Exception as e:
+            await query.edit_message_text(f"❌ Pre-flight failed: {e}")
+        return
+
+    if data == "init_airs_confirm":
+        # ── Step 2: Sequential execution with rollback ─────────────────────────
+        pending = context.user_data.get("pending_airs")
+        if not pending:
+            await query.edit_message_text("❌ Session expired. Run /suggest again.")
+            return
+
+        trades       = pending["trades"]
+        exec_prices  = pending["exec_prices"]
+        campaign_name = pending["campaign"]
+        await query.edit_message_text("⏳ Executing legs sequentially...")
+
+        filled = []  # legs that placed successfully — needed for rollback
+        failed_leg = None
+
+        try:
+            await deribit_client.authenticate()
+            for t in trades:
+                price = exec_prices.get(t["instr"])
                 try:
-                    ticker = await deribit_client.get_ticker(t["instr"])
                     if t["side"] == "buy":
-                        price = ticker.get("best_ask_price") or ticker.get("last_price")
                         res = await deribit_client.buy(t["instr"], t["amount"], price=price, order_type="limit")
                     else:
-                        price = ticker.get("best_bid_price") or ticker.get("last_price")
                         res = await deribit_client.sell(t["instr"], t["amount"], price=price, order_type="limit")
                     order = res.get("order", {})
-                    return {"instr": t["instr"], "status": "✅", "id": order.get("order_id"),
-                            "price": order.get("average_price", 0), "role": t["role"]}
+                    filled.append({
+                        "instr":    t["instr"],
+                        "role":     t["role"],
+                        "side":     t["side"],
+                        "amount":   t["amount"],
+                        "order_id": order.get("order_id"),
+                        "state":    order.get("order_state", "open"),
+                        "price":    order.get("average_price", price),
+                    })
                 except Exception as e:
-                    return {"instr": t["instr"], "status": "❌", "error": str(e), "role": t["role"]}
+                    failed_leg = {"instr": t["instr"], "error": str(e)}
+                    break
 
-            results = await asyncio.gather(*(execute_leg(t) for t in trades))
-            campaign_name = f"AIRS-{datetime.now(UTC).strftime('%b%Y').upper()}"
+            if failed_leg:
+                # ── Rollback ───────────────────────────────────────────────────
+                rb_lines = [
+                    f"❌ *Leg failed:* {failed_leg['instr']}\n  └ {failed_leg['error']}\n",
+                    f"⏪ Rolling back {len(filled)} filled leg(s)...",
+                ]
+                for f in filled:
+                    try:
+                        if f["state"] in ("open", "untriggered"):
+                            await deribit_client.cancel_order(f["order_id"])
+                            rb_lines.append(f"✅ Cancelled order for {f['instr']}")
+                        else:
+                            # Position filled — reverse it
+                            ticker = await deribit_client.get_ticker(f["instr"])
+                            if f["side"] == "buy":
+                                price = ticker.get("best_bid_price") or ticker.get("last_price")
+                                await deribit_client.sell(f["instr"], f["amount"], price=price, order_type="limit")
+                            else:
+                                price = ticker.get("best_ask_price") or ticker.get("last_price")
+                                await deribit_client.buy(f["instr"], f["amount"], price=price, order_type="limit")
+                            rb_lines.append(f"✅ Closed position in {f['instr']}")
+                    except Exception as re:
+                        rb_lines.append(f"⚠️ Rollback failed for {f['instr']}: {re}\n  → Close manually with /close {f['instr']}")
+                await query.edit_message_text("\n".join(rb_lines), parse_mode='Markdown')
+                return
+
+            # ── All legs filled — tag and report ──────────────────────────────
             summary = [f"🚀 *AIRS Campaign ({campaign_name})*\n"]
-            for r in results:
-                if r["status"] == "✅":
-                    summary.append(f"✅ {r['instr']}\n  └ Price: {r['price']} | ID: {r['id']}")
-                    # Auto-tag: map instrument back to its role
-                    role = r.get("role", "")
-                    if role:
-                        tag_instrument(r["instr"], role, campaign_name)
-                else:
-                    summary.append(f"❌ {r['instr']}\n  └ {r['error']}")
-            summary.append(f"\n_Use /tag to re-assign legs or add to a different campaign._")
+            for f in filled:
+                role_label = ROLE_LABELS.get(f["role"], f["role"])
+                summary.append(f"✅ *[{role_label}]* {f['instr']}\n  └ Price: {f['price']} | ID: {f['order_id']}")
+                tag_instrument(f["instr"], f["role"], campaign_name)
+            summary.append("\n_Use /tag to re-assign legs or add to a different campaign._")
             await query.edit_message_text("\n".join(summary), parse_mode='Markdown')
+
         except Exception as e:
-            await query.edit_message_text(f"❌ Critical error: {e}")
+            await query.edit_message_text(f"❌ Critical error during execution: {e}")
+        return
+
+    if data == "init_airs_cancel":
+        context.user_data.pop("pending_airs", None)
+        await query.edit_message_text("❌ Execution cancelled.")
         return
 
     if data == "take_free":

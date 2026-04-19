@@ -148,6 +148,9 @@ class DeribitClient:
             params["price"] = price
         return await self._post("private/sell", params)
 
+    async def cancel_order(self, order_id: str) -> Dict[str, Any]:
+        return await self._post("private/cancel", {"order_id": order_id})
+
     async def find_instruments_by_delta(self, target_delta: float, target_dte: int = 30, opt_type: str = "C") -> list:
         spot = await self.get_btc_spot_price()
         instruments = await self._get("public/get_instruments", {"currency": "BTC", "kind": "option"})
