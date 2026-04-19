@@ -120,7 +120,7 @@ def tag_instrument(instrument_name: str, role_input: str, campaign_name: str) ->
             db.add(leg)
 
         db.commit()
-        return True, f"Tagged {instrument_name} as *{role}* in campaign *{campaign_name}* ({spread_type})."
+        return True, f"Tagged {instrument_name} as {role} in campaign {campaign_name} ({spread_type})."
     except Exception as e:
         db.rollback()
         return False, f"DB error: {e}"

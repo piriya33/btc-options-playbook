@@ -449,7 +449,7 @@ async def tag_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     instrument, role_input, campaign = args
     ok, msg = tag_instrument(instrument, role_input, campaign)
     prefix = "✅" if ok else "❌"
-    await update.message.reply_text(f"{prefix} {msg}", parse_mode='Markdown')
+    await update.message.reply_text(f"{prefix} {msg}")
 
 
 async def untag_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -463,7 +463,7 @@ async def untag_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     ok, msg = untag_instrument(args[0])
     prefix = "✅" if ok else "❌"
-    await update.message.reply_text(f"{prefix} {msg}")
+    await update.message.reply_text(f"{prefix} {msg}")  # plain text — no parse_mode
 
 
 async def campaigns_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
