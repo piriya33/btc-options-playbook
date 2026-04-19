@@ -1,23 +1,20 @@
 import os
-import sys
 import io
 import logging
 import asyncio
-import requests
+import httpx
 from datetime import time, datetime, UTC
 
 from dotenv import load_dotenv
-load_dotenv("credentials.env")
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, CallbackQueryHandler
-
-sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 
 from deribit.client import DeribitClient
 from analyzer.logic import AIRSAnalyzer
 from analyzer.charts import generate_payoff_chart
 
+from database.session import init_db
 from database.queries import (
     get_iv_rank_30d,
     get_initial_btc_equity,
@@ -33,12 +30,12 @@ logger = logging.getLogger(__name__)
 deribit_client = DeribitClient(testnet=True)
 
 # ── Constants ──────────────────────────────────────────────────────────────────
-DELTA_DRIFT_LIMIT = 0.15   # Alert if group delta exceeds this
-MARGIN_ALERT_PCT  = 70.0   # Alert if margin utilisation exceeds this
+DELTA_DRIFT_LIMIT = 0.15
+MARGIN_WARN_PCT   = 25.0   # blueprint hard limit — log a warning
+MARGIN_ALERT_PCT  = 40.0   # critical — send Telegram alert
 
 # ── Shared report helper ───────────────────────────────────────────────────────
 async def _fetch_data():
-    """Authenticate and return all required data."""
     await deribit_client.authenticate()
     spot_price      = await deribit_client.get_btc_spot_price()
     current_dvol    = await deribit_client.get_dvol()
@@ -48,8 +45,8 @@ async def _fetch_data():
     initial_equity  = get_initial_btc_equity()
     return spot_price, positions, account_summary, iv_data, initial_equity
 
+
 async def _get_report():
-    """Generate text report + inline keyboard."""
     try:
         spot_price, positions, account_summary, iv_data, initial_equity = await _fetch_data()
         analyzer = AIRSAnalyzer(spot_price, positions, account_summary, iv_data, initial_equity)
@@ -66,19 +63,16 @@ async def _get_report():
                 row.append(InlineKeyboardButton(f"🔄 Roll {label}", callback_data=f"roll:{instr}"))
             keyboard.append(row)
 
-        # Group-level action buttons
-        keyboard.append([
-            InlineKeyboardButton("🎯 Take Free Options", callback_data="take_free"),
-        ])
+        keyboard.append([InlineKeyboardButton("🎯 Take Free Options", callback_data="take_free")])
 
         return data["text"], InlineKeyboardMarkup(keyboard) if keyboard else None
     except Exception as e:
         logger.error(f"Error generating report: {e}", exc_info=True)
         return f"⚠️ Error generating report: {e}", None
 
+
 # ── Delta Drift / Margin background monitor ────────────────────────────────────
 async def _check_alerts(context: ContextTypes.DEFAULT_TYPE):
-    """Background job: send alerts if delta drifts or margin spikes."""
     chat_id = get_morning_push_chat_id()
     if not chat_id:
         return
@@ -88,12 +82,21 @@ async def _check_alerts(context: ContextTypes.DEFAULT_TYPE):
         directives = analyzer.analyze_positions()
         margin_info = analyzer.analyze_margin()
 
-        # Margin alert
         util = margin_info["margin_utilization_pct"]
         if util >= MARGIN_ALERT_PCT:
             await context.bot.send_message(
                 chat_id=chat_id,
-                text=f"🚨 *MARGIN ALERT*\nUtilisation: *{util:.1f}%* (Limit: {MARGIN_ALERT_PCT:.0f}%)\nReduce position size or add collateral immediately.",
+                text=(f"🚨 *MARGIN CRITICAL*\n"
+                      f"Utilisation: *{util:.1f}%* (limit: {MARGIN_WARN_PCT:.0f}%, critical: {MARGIN_ALERT_PCT:.0f}%)\n"
+                      f"Reduce position size or add collateral immediately."),
+                parse_mode='Markdown'
+            )
+        elif util >= MARGIN_WARN_PCT:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=(f"⚠️ *MARGIN WARNING*\n"
+                      f"Utilisation: *{util:.1f}%* has breached the blueprint limit of {MARGIN_WARN_PCT:.0f}%.\n"
+                      f"Monitor closely."),
                 parse_mode='Markdown'
             )
 
@@ -121,6 +124,7 @@ async def _check_alerts(context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"Alert check failed: {e}")
 
+
 # ── Command handlers ───────────────────────────────────────────────────────────
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -129,18 +133,18 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Commands: /morning /status /suggest /iv /fear_greed /buy /sell /close /group /ungroup /register"
     )
 
+
 async def morning(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Fetching Deribit data... ⏳")
     report, markup = await _get_report()
     await update.message.reply_text(report, parse_mode='Markdown', reply_markup=markup)
 
+
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Send status + payoff chart."""
     await update.message.reply_text("Generating live status... ⏳")
     report, markup = await _get_report()
     await update.message.reply_text(report, parse_mode='Markdown', reply_markup=markup)
 
-    # Send payoff diagram
     try:
         spot_price, positions, _, _, _ = await _fetch_data()
         if positions:
@@ -153,23 +157,23 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Payoff chart error: {e}")
         await update.message.reply_text(f"⚠️ Could not generate payoff chart: {e}")
 
+
 async def iv_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/iv — Show DVOL vs realised volatility."""
     await update.message.reply_text("Fetching volatility data... ⏳")
     try:
         dvol = await deribit_client.get_dvol()
         iv_data = get_iv_rank_30d(dvol)
 
-        # Rough realised vol proxy via 30d BTC price change (public endpoint)
         rv_url = "https://api.coingecko.com/api/v3/coins/bitcoin/market_chart?vs_currency=usd&days=30&interval=daily"
-        r = requests.get(rv_url, timeout=8)
+        async with httpx.AsyncClient(timeout=8.0) as client:
+            r = await client.get(rv_url)
         prices = [p[1] for p in r.json().get("prices", [])]
+
+        realised_vol = None
         if len(prices) > 2:
             import numpy as np
             returns = np.diff(np.log(prices))
             realised_vol = float(np.std(returns) * np.sqrt(365) * 100)
-        else:
-            realised_vol = None
 
         lines = [
             "📐 *Volatility Intelligence*",
@@ -178,8 +182,8 @@ async def iv_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ]
         if realised_vol:
             vol_premium = dvol - realised_vol
-            verdict = "🟢 *Options CHEAP* — IV < RV. Good time to BUY hedges." if vol_premium < 0 \
-                      else f"🔴 *Options EXPENSIVE* — IV premium: +{vol_premium:.1f} pts. Good time to SELL yield."
+            verdict = ("🟢 *Options CHEAP* — IV < RV. Good time to BUY hedges." if vol_premium < 0
+                       else f"🔴 *Options EXPENSIVE* — IV premium: +{vol_premium:.1f} pts. Good time to SELL yield.")
             lines.append(f"• 30d Realised Vol: *{realised_vol:.2f}*")
             lines.append(f"• IV Premium: *{vol_premium:+.2f}* pts")
             lines.append(f"\n{verdict}")
@@ -188,10 +192,11 @@ async def iv_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await update.message.reply_text(f"❌ Error fetching IV data: {e}")
 
+
 async def fear_greed_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/fear_greed — Show crypto Fear & Greed index."""
     try:
-        r = requests.get("https://api.alternative.me/fng/?limit=1", timeout=8)
+        async with httpx.AsyncClient(timeout=8.0) as client:
+            r = await client.get("https://api.alternative.me/fng/?limit=1")
         data = r.json()["data"][0]
         value = int(data["value"])
         label = data["value_classification"]
@@ -215,6 +220,7 @@ async def fear_greed_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await update.message.reply_text(f"❌ Error fetching Fear & Greed: {e}")
 
+
 async def group_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
     if len(args) != 2:
@@ -226,6 +232,7 @@ async def group_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("❌ Failed to group instrument.")
 
+
 async def ungroup_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
     if len(args) != 1:
@@ -236,9 +243,11 @@ async def ungroup_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("❌ Instrument not found in any group.")
 
+
 async def register(update: Update, context: ContextTypes.DEFAULT_TYPE):
     set_morning_push_chat_id(update.effective_chat.id)
     await update.message.reply_text("✅ Registered! Daily Morning Briefing at 08:00 UTC.")
+
 
 async def scheduled_morning_push(context: ContextTypes.DEFAULT_TYPE):
     chat_id = get_morning_push_chat_id()
@@ -246,8 +255,8 @@ async def scheduled_morning_push(context: ContextTypes.DEFAULT_TYPE):
         report, markup = await _get_report()
         await context.bot.send_message(chat_id=chat_id, text=report, parse_mode='Markdown', reply_markup=markup)
 
+
 async def trade_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Execute a trade: /buy <instrument> <amount> [price] or /sell <instrument> <amount> [price]"""
     command = update.message.text.split()[0][1:]
     args = context.args
     if len(args) < 2:
@@ -274,6 +283,7 @@ async def trade_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await update.message.reply_text(f"❌ Error executing trade: {e}")
 
+
 async def close_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
     if len(args) != 1:
@@ -289,14 +299,18 @@ async def close_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"❌ No open position for {instrument}")
             return
         size = pos["size"]
+        ticker = await deribit_client.get_ticker(instrument)
         if size > 0:
-            res = await deribit_client.sell(instrument, abs(size), order_type="market")
+            price = ticker.get("best_bid_price") or ticker.get("last_price")
+            res = await deribit_client.sell(instrument, abs(size), price=price, order_type="limit")
         else:
-            res = await deribit_client.buy(instrument, abs(size), order_type="market")
+            price = ticker.get("best_ask_price") or ticker.get("last_price")
+            res = await deribit_client.buy(instrument, abs(size), price=price, order_type="limit")
         order = res.get("order", {})
         await update.message.reply_text(f"✅ Closed! ID: {order.get('order_id')}")
     except Exception as e:
         await update.message.reply_text(f"❌ Error: {e}")
+
 
 async def suggest_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Searching for the best instruments (30-45 DTE)... 🔍")
@@ -342,13 +356,13 @@ async def suggest_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Error finding suggestions: {e}")
         await update.message.reply_text(f"❌ Error finding suggestions: {e}")
 
+
 # ── Button handler ─────────────────────────────────────────────────────────────
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     data = query.data
 
-    # ── Init AIRS ──────────────────────────────────────────────────────────────
     if data == "init_airs":
         suggestion = context.user_data.get("last_suggestion")
         if not suggestion:
@@ -394,7 +408,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text(f"❌ Critical error: {e}")
         return
 
-    # ── Take Free Options: close short legs, keep long ────────────────────────
     if data == "take_free":
         await query.edit_message_text("⏳ Closing all short (yield) legs...")
         try:
@@ -426,7 +439,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text(f"❌ Error: {e}")
         return
 
-    # ── Roll a single instrument ───────────────────────────────────────────────
     if data.startswith("roll:"):
         instrument = data.split(":", 1)[1]
         await query.edit_message_text(
@@ -436,7 +448,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # ── Close a single instrument ──────────────────────────────────────────────
     if data.startswith("close:"):
         instrument = data.split(":", 1)[1]
         await query.edit_message_text(f"⏳ Closing {instrument}...")
@@ -461,7 +472,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text(f"❌ Error closing {instrument}: {e}")
         return
 
-    # ── Alert actions (informational) ─────────────────────────────────────────
     if data.startswith("alert_hedge:") or data.startswith("alert_close_yield:"):
         action, gid = data.split(":", 1)
         if action == "alert_hedge":
@@ -476,6 +486,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         return
 
+
+# ── Shutdown ───────────────────────────────────────────────────────────────────
+async def _post_shutdown(application):
+    await deribit_client.aclose()
+
+
 # ── Main ───────────────────────────────────────────────────────────────────────
 def main():
     load_dotenv("credentials.env")
@@ -484,7 +500,14 @@ def main():
         logger.error("No TELEGRAM_BOT_TOKEN found.")
         return
 
-    application = ApplicationBuilder().token(token).build()
+    init_db()
+
+    application = (
+        ApplicationBuilder()
+        .token(token)
+        .post_shutdown(_post_shutdown)
+        .build()
+    )
 
     application.add_handler(CommandHandler("start",      start))
     application.add_handler(CommandHandler("morning",    morning))
@@ -502,11 +525,11 @@ def main():
 
     job_queue = application.job_queue
     job_queue.run_daily(scheduled_morning_push, time=time(8, 0))
-    # Check for delta drift + margin alerts every 15 minutes
     job_queue.run_repeating(_check_alerts, interval=900, first=60)
 
     logger.info("Starting bot polling...")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
+
 
 if __name__ == "__main__":
     main()

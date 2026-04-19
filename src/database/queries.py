@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, UTC
 from sqlalchemy import func
 from database.session import SessionLocal
 from database.models import DVOLHistory, TradeGroup, TradeLeg, AppSettings
@@ -7,7 +7,7 @@ def get_iv_rank_30d(current_dvol: float = None) -> dict:
     db = SessionLocal()
     try:
         # Get data from the last 30 days
-        thirty_days_ago = datetime.utcnow() - timedelta(days=30)
+        thirty_days_ago = datetime.now(UTC).replace(tzinfo=None) - timedelta(days=30)
         records = db.query(DVOLHistory).filter(DVOLHistory.date >= thirty_days_ago).all()
         
         if not records and current_dvol is None:

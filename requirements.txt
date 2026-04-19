@@ -1,5 +1,7 @@
 httpx
-python-telegram-bot
+python-telegram-bot[job-queue]
 sqlalchemy
 pydantic
 python-dotenv
+matplotlib
+numpy

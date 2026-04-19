@@ -1,0 +1,19 @@
+[project]
+name = "airy"
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = [
+    "httpx",
+    "python-telegram-bot[job-queue]",
+    "sqlalchemy",
+    "pydantic",
+    "python-dotenv",
+    "matplotlib",
+    "numpy",
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "pytest-asyncio", "freezegun"]
+
+[tool.setuptools.packages.find]
+where = ["src"]

@@ -1,5 +1,5 @@
 from typing import List, Dict, Any
-from datetime import datetime
+from datetime import datetime, UTC
 from database.queries import get_trade_group_for_instrument
 
 class AIRSAnalyzer:
@@ -40,7 +40,7 @@ class AIRSAnalyzer:
             
             try:
                 expiry = datetime.strptime(date_str, "%d%b%y")
-                dte = (expiry - datetime.utcnow()).days
+                dte = (expiry - datetime.now(UTC).replace(tzinfo=None)).days
             except Exception:
                 dte = 0
                 
@@ -109,8 +109,6 @@ class AIRSAnalyzer:
                 elif self.spot_price <= strike or abs(contract_delta) >= 0.50:
                     d_obj["status"] = "ROLL"
                     d_obj["directive"] = f"Spot <= Strike or Delta ({round(abs(contract_delta), 2)}) >= 0.50. Roll Down and Out."
-                elif self.spot_price <= strike:
-                    d_obj["directive"] = "Spot below short put. Relying on long hedges."
             elif size > 0:
                 if dte <= 7:
                      d_obj["directive"] = "Expiring in <= 7 days. Close if profitable, else let expire."

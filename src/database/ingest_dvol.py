@@ -1,10 +1,6 @@
 import csv
 import os
-import sys
-from datetime import datetime
-
-# Add src to the Python path
-sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
+from datetime import datetime, UTC
 
 from database.session import init_db, SessionLocal
 from database.models import DVOLHistory
@@ -21,7 +17,7 @@ def ingest_csv(filepath: str):
                 try:
                     # time is unix timestamp in seconds
                     timestamp = int(row['time'])
-                    dt = datetime.utcfromtimestamp(timestamp)
+                    dt = datetime.fromtimestamp(timestamp, UTC).replace(tzinfo=None)
                     dvol_val = float(row['close'])
                     
                     # check if exists
