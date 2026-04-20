@@ -28,7 +28,11 @@ from database.queries import (
     get_all_open_campaigns,
     list_legs_for_campaign,
     get_legs_for_spread,
+    is_harvest_alerted,
+    mark_harvest_alerted,
+    clear_harvest_alerted,
 )
+from database.ingest_dvol import ensure_dvol_history, ingest_yesterday_dvol
 
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -45,8 +49,6 @@ HARVEST_TARGET_PCT = 50.0   # alert when short leg profit >= this % of entry cre
 YIELD_BLOCK_PCT    = 5.0    # annualised net yield % — block initiation below this
 YIELD_CAUTION_PCT  = 10.0   # annualised net yield % — caution below this
 
-# Track harvest alerts sent this session — prevents re-alerting every 15 min
-_harvest_alerted: set = set()
 
 
 def _assess_spread(ticker: dict) -> dict:
@@ -283,8 +285,8 @@ async def _check_alerts(context: ContextTypes.DEFAULT_TYPE):
             leg_info = get_leg_info(instr)
             if leg_info.get("role") not in ("yield_call", "yield_put"):
                 continue
-            if instr in _harvest_alerted:
-                continue  # already alerted this session
+            if is_harvest_alerted(instr):
+                continue  # already alerted (persisted across restarts)
 
             entry_credit = abs(pos.get("average_price", 0))
             floating_pnl = pos.get("floating_profit_loss", 0)
@@ -295,7 +297,7 @@ async def _check_alerts(context: ContextTypes.DEFAULT_TYPE):
             profit_pct = (floating_pnl / (entry_credit * abs(pos["size"]))) * 100 if entry_credit > 0 else 0
 
             if profit_pct >= HARVEST_TARGET_PCT:
-                _harvest_alerted.add(instr)
+                mark_harvest_alerted(instr)
                 role_label = ROLE_LABELS.get(leg_info.get("role", ""), "")
                 campaign   = leg_info.get("campaign_name", "unknown")
                 spread_id  = leg_info.get("spread_id")
@@ -575,11 +577,12 @@ async def close_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             res = await deribit_client.buy(instrument, abs(size), price=price, order_type="limit")
         order = res.get("order", {})
 
-        # Record realized PnL if this leg is tagged
+        # Record realized PnL and clear harvest alert flag
         pnl_msg = ""
         ok, msg = close_leg(instrument, realized_pnl)
         if ok:
             pnl_msg = f"\nRealized PnL: {realized_pnl:+.5f} BTC (recorded)"
+            clear_harvest_alerted(instrument)
         elif "not tagged" not in msg:
             pnl_msg = f"\n⚠️ PnL not recorded: {msg}"
 
@@ -997,6 +1000,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ok, msg = close_leg(instrument, realized_pnl)
             if ok:
                 pnl_msg = f"\nRealized PnL: {realized_pnl:+.5f} BTC (recorded)"
+                clear_harvest_alerted(instrument)
 
             await query.edit_message_text(
                 f"✅ Closed {instrument}!\nOrder ID: {order.get('order_id')}{pnl_msg}"
@@ -1068,7 +1072,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
 
-# ── Shutdown ───────────────────────────────────────────────────────────────────
+# ── Startup / Shutdown ────────────────────────────────────────────────────────
+async def _post_init(application):
+    """Run once after the Application is built but before polling starts."""
+    status = await ensure_dvol_history()
+    logger.info(status)
+
+
 async def _post_shutdown(application):
     await deribit_client.aclose()
 
@@ -1086,6 +1096,7 @@ def main():
     application = (
         ApplicationBuilder()
         .token(token)
+        .post_init(_post_init)
         .post_shutdown(_post_shutdown)
         .build()
     )
@@ -1107,7 +1118,8 @@ def main():
     application.add_handler(CallbackQueryHandler(button_handler))
 
     job_queue = application.job_queue
-    job_queue.run_daily(scheduled_morning_push, time=time(8, 0))
+    job_queue.run_daily(scheduled_morning_push,  time=time(8,  0))
+    job_queue.run_daily(ingest_yesterday_dvol,   time=time(0, 30))
     job_queue.run_repeating(_check_alerts, interval=900, first=60)
 
     logger.info("Starting bot polling...")

@@ -6,6 +6,41 @@ from database.models import (
 )
 
 
+# ── DVOL helpers ───────────────────────────────────────────────────────────────
+
+def get_latest_dvol_date():
+    """Return the most recent DVOLHistory.date, or None if the table is empty."""
+    db = SessionLocal()
+    try:
+        record = db.query(DVOLHistory).order_by(DVOLHistory.date.desc()).first()
+        return record.date if record else None
+    finally:
+        db.close()
+
+
+def upsert_dvol_candles(candles: list):
+    """
+    Upsert a list of [timestamp_ms, open, high, low, close] candles into DVOLHistory.
+    Uses the close value (index 4). Idempotent — safe to call repeatedly.
+    """
+    db = SessionLocal()
+    try:
+        for candle in candles:
+            ts_ms  = candle[0]
+            close  = candle[4]
+            dt = datetime.fromtimestamp(ts_ms / 1000, UTC).replace(
+                hour=0, minute=0, second=0, microsecond=0, tzinfo=None
+            )
+            existing = db.query(DVOLHistory).filter(DVOLHistory.date == dt).first()
+            if existing:
+                existing.dvol = close
+            else:
+                db.add(DVOLHistory(date=dt, dvol=close))
+        db.commit()
+    finally:
+        db.close()
+
+
 # ── DVOL / IV Rank ─────────────────────────────────────────────────────────────
 
 def get_iv_rank_30d(current_dvol: float = None) -> dict:
@@ -274,5 +309,42 @@ def get_legs_for_spread(spread_id: int) -> list:
             {"instrument_name": leg.instrument_name, "role": leg.role}
             for leg in spread.legs
         ]
+    finally:
+        db.close()
+
+
+# ── Harvest alert persistence ──────────────────────────────────────────────────
+# Stored as AppSettings rows with key "harvest_alerted:<instrument>" → value 1.0
+# This survives bot restarts so we don't re-alert on the same leg.
+
+def is_harvest_alerted(instrument_name: str) -> bool:
+    db = SessionLocal()
+    try:
+        key = f"harvest_alerted:{instrument_name}"
+        return db.query(AppSettings).filter(AppSettings.key == key).first() is not None
+    finally:
+        db.close()
+
+
+def mark_harvest_alerted(instrument_name: str):
+    db = SessionLocal()
+    try:
+        key = f"harvest_alerted:{instrument_name}"
+        if not db.query(AppSettings).filter(AppSettings.key == key).first():
+            db.add(AppSettings(key=key, value=1.0))
+            db.commit()
+    finally:
+        db.close()
+
+
+def clear_harvest_alerted(instrument_name: str):
+    """Call when a leg is closed so it can be re-alerted if re-opened."""
+    db = SessionLocal()
+    try:
+        key = f"harvest_alerted:{instrument_name}"
+        row = db.query(AppSettings).filter(AppSettings.key == key).first()
+        if row:
+            db.delete(row)
+            db.commit()
     finally:
         db.close()
