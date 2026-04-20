@@ -74,23 +74,25 @@ class AIRSAnalyzer:
                 continue
 
             strike, opt_type, dte = parsed["strike"], parsed["type"], parsed["dte"]
-            metrics = f"Δ: {round(raw_delta, 2)} | DTE: {dte} | PnL: {round(pnl, 5)} BTC"
 
             d_obj = {
-                "instrument":    instrument,
-                "campaign_name": leg_info.get("campaign_name", "Untagged"),
-                "spread_type":   leg_info.get("spread_type",   ""),
-                "spread_id":     leg_info.get("spread_id"),
-                "role":          leg_info.get("role",          ""),
-                "status":        "HOLD",
-                "directive":     "Monitoring",
-                "metrics":       metrics,
-                "raw_delta":     raw_delta,
+                "instrument":     instrument,
+                "campaign_name":  leg_info.get("campaign_name", "Untagged"),
+                "spread_type":    leg_info.get("spread_type",   ""),
+                "spread_id":      leg_info.get("spread_id"),
+                "role":           leg_info.get("role",          ""),
+                "status":         "HOLD",
+                "directive":      "Monitoring",
+                "raw_delta":      raw_delta,
                 "contract_delta": contract_delta,
-                "raw_gamma":     gamma,
-                "raw_pnl":       pnl,
-                "raw_size":      size,
-                "average_price": pos.get("average_price", 0),
+                "raw_gamma":      gamma,
+                "raw_pnl":        pnl,
+                "raw_size":       size,
+                "average_price":  pos.get("average_price", 0),
+                # parsed fields exposed for clean rendering
+                "dte":            dte,
+                "strike":         int(strike),
+                "opt_type":       opt_type,
             }
 
             # ── AIRS Playbook rules ────────────────────────────────────────────
@@ -227,7 +229,12 @@ class AIRSAnalyzer:
             )
 
         # ── Campaigns ──────────────────────────────────────────────────────────
-        report.append("\n*Directives by Campaign:*")
+        report.append("\n*Campaigns:*")
+
+        _ROLE_LETTER = {
+            "yield_call": "A", "yield_put": "B",
+            "crash_hedge": "C", "moon_hedge": "D",
+        }
 
         campaigns: Dict[str, Dict[str, list]] = {}
         action_msgs = []
@@ -258,19 +265,16 @@ class AIRSAnalyzer:
                     seen_spreads.add(sid)
             cam_total = cam_float + cam_realized
 
-            report.append(f"\n*Campaign: {cam_name}*")
-            report.append(
-                f"  └ Δ: {round(cam_delta, 3)} | Total PnL: {round(cam_total, 5)} BTC"
-            )
-            if cam_realized != 0:
-                report.append(
-                    f"    (Floating: {round(cam_float, 5)} | Realized: {round(cam_realized, 5)})"
-                )
+            real_str = (f"  (Float {cam_float:+.5f} | Real {cam_realized:+.5f})"
+                        if cam_realized != 0 else "")
+            report.append(f"\n*{cam_name}*  Δ {cam_delta:+.3f}  PnL {cam_total:+.5f} BTC")
+            if real_str:
+                report.append(real_str)
 
             for spread_type, legs in spreads.items():
                 spread_label = (
-                    "📞 Call Spread (A+D)" if spread_type == "call_spread" else
-                    "📉 Put Spread  (B+C)" if spread_type == "put_spread"  else
+                    "📞 Call Spread" if spread_type == "call_spread" else
+                    "📉 Put Spread"  if spread_type == "put_spread"  else
                     "⚠️ Untagged"
                 )
                 spr_delta = sum(d.get("raw_delta", 0) for d in legs)
@@ -286,23 +290,40 @@ class AIRSAnalyzer:
                 net_credit = sum(-d.get("raw_size", 0) * d.get("average_price", 0) for d in legs)
                 credit_label = "Credit" if net_credit >= 0 else "Debit"
 
-                report.append(f"  {spread_label}")
                 report.append(
-                    f"    └ Δ: {round(spr_delta, 3)} | "
-                    f"PnL: {round(spr_total, 5)} BTC | "
-                    f"Net {credit_label}: {round(abs(net_credit), 5)} BTC"
+                    f"  {spread_label}  "
+                    f"Δ {spr_delta:+.3f}  PnL {spr_total:+.5f}  "
+                    f"Net {credit_label} {abs(net_credit):.5f} BTC"
                 )
                 if spr_realized != 0:
                     report.append(
-                        f"      (Float: {round(spr_float, 5)} | Real: {round(spr_realized, 5)})"
+                        f"    Float {spr_float:+.5f} | Real {spr_realized:+.5f}"
                     )
 
+                # ── Per-leg rows ───────────────────────────────────────────────
                 for d in legs:
-                    role_label = ROLE_LABELS.get(d.get("role", ""), d.get("role", "—"))
+                    letter   = _ROLE_LETTER.get(d.get("role", ""), "?")
+                    strike   = d.get("strike", 0)
+                    opt_type = d.get("opt_type", "?")
+                    dte      = d.get("dte", 0)
+                    status   = d.get("status", "HOLD")
+
+                    if status == "ROLL":
+                        st_tag = "🔄 ROLL"
+                    elif dte <= 7:
+                        st_tag = "⏰ EXPIRING"
+                    else:
+                        st_tag = "✅"
+
                     report.append(
-                        f"  - *{d['instrument']}* [{role_label}]: "
-                        f"[{d['metrics']}] → *{d['status']}*: {d['directive']}"
+                        f"    [{letter}] {strike}-{opt_type}  "
+                        f"Δ {d['raw_delta']:+.3f}  "
+                        f"PnL {d['raw_pnl']:+.5f}  "
+                        f"DTE {dte}  {st_tag}"
                     )
+                    # Only show directive text when it needs attention
+                    if status == "ROLL" or dte <= 7:
+                        report.append(f"       ↳ {d['directive']}")
 
         return "\n".join(report)
 
