@@ -12,13 +12,8 @@ engine = create_engine(f"sqlite:///{DB_PATH}", echo=False)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 def init_db():
-    # Phase 2 migration: drop legacy tables before creating the new schema.
-    # Safe to run repeatedly — IF NOT EXISTS guards prevent data loss on tables
-    # that were already migrated.
-    with engine.connect() as conn:
-        conn.execute(text("DROP TABLE IF EXISTS trade_legs"))
-        conn.execute(text("DROP TABLE IF EXISTS trade_groups"))
-        conn.commit()
+    # create_all is a no-op for tables that already exist — tags/campaigns are preserved.
+    # The old Phase 2 DROP TABLE trade_legs has been removed; do not add it back.
     Base.metadata.create_all(bind=engine)
 
 def get_db():
