@@ -11,7 +11,7 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, CallbackQueryHandler
 
 from deribit.client import DeribitClient
-from analyzer.logic import AIRSAnalyzer
+from analyzer.logic import AIRSAnalyzer, detect_campaign_phase, recycle_recommendation, _PHASE_EMOJI
 from analyzer.charts import generate_payoff_chart
 from database.models import ROLE_LABELS
 
@@ -329,7 +329,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         rf"Hi {user.mention_html()}! I am AIRY, your AIRS playbook bot.<br/>"
         "<b>Market:</b> /morning /status /suggest /iv /fear_greed<br/>"
         "<b>Trading:</b> /buy /sell /close<br/>"
-        "<b>Campaigns:</b> /campaigns /legs<br/>"
+        "<b>Campaigns:</b> /campaigns /legs /recycle<br/>"
         "<b>Tagging:</b> /tag &lt;instrument&gt; &lt;role&gt; &lt;campaign&gt; | /untag &lt;instrument&gt;<br/>"
         "  Roles: A=yield_call  B=yield_put  C=crash_hedge  D=moon_hedge<br/>"
         "  Example: <code>/tag BTC-27JUN25-100000-C A MAY2026</code><br/>"
@@ -510,6 +510,143 @@ async def legs_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 role_label = ROLE_LABELS.get(leg["role"], leg["role"])
                 lines.append(f"    [{role_label}]  {leg['instrument_name']}")
     await update.message.reply_text("\n".join(lines), parse_mode='Markdown')
+
+
+async def recycle_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /recycle <campaign>
+    Shows hedge status for a COASTING campaign and recommends next action.
+    """
+    if not context.args:
+        await update.message.reply_text("Usage: /recycle <campaign>\nExample: /recycle AIRS-260529-01")
+        return
+
+    campaign_name = context.args[0]
+    campaigns = get_all_open_campaigns()
+    campaign  = next((c for c in campaigns if c["name"] == campaign_name), None)
+    if not campaign:
+        await update.message.reply_text(f"❌ Campaign '{campaign_name}' not found. Use /campaigns to list open campaigns.")
+        return
+
+    await update.message.reply_text("Checking campaign status... ⏳")
+    try:
+        await deribit_client.authenticate()
+        positions = await deribit_client.get_open_positions()
+        pos_map   = {p["instrument_name"]: p for p in positions}
+
+        phase = detect_campaign_phase(campaign, positions)
+        ph_emoji = _PHASE_EMOJI.get(phase, "")
+
+        if phase != "COASTING":
+            await update.message.reply_text(
+                f"{ph_emoji} *{campaign_name}* is *{phase}*, not COASTING.\n\n"
+                "_Recycle is only available once all yield shorts have been harvested "
+                "and at least one hedge leg remains._",
+                parse_mode='Markdown'
+            )
+            return
+
+        # ── Gather active hedge legs ──────────────────────────────────────────
+        hedge_legs = []
+        for spread in campaign["spreads"]:
+            for leg in spread["legs"]:
+                instr = leg["instrument_name"]
+                pos   = pos_map.get(instr)
+                if not pos or pos.get("size", 0) == 0:
+                    continue
+                if leg["role"] not in ("crash_hedge", "moon_hedge"):
+                    continue
+
+                parsed = instr.split("-")
+                dte = None
+                entry_cost = abs(pos.get("average_price", 0))
+                if len(parsed) == 4:
+                    try:
+                        from datetime import datetime, UTC
+                        expiry = datetime.strptime(parsed[1], "%d%b%y")
+                        dte    = (expiry - datetime.now(UTC).replace(tzinfo=None)).days
+                    except Exception:
+                        pass
+
+                # Current mid price
+                try:
+                    ticker  = await deribit_client.get_ticker(instr)
+                    bid     = ticker.get("best_bid_price", 0) or 0
+                    ask     = ticker.get("best_ask_price", 0) or 0
+                    mid     = (bid + ask) / 2 if bid and ask else 0
+                except Exception:
+                    mid = 0
+
+                residual_pct = (mid / entry_cost * 100) if entry_cost > 0 else 0
+                hedge_legs.append({
+                    "instr":        instr,
+                    "role":         leg["role"],
+                    "dte":          dte,
+                    "entry_cost":   entry_cost,
+                    "current_mid":  round(mid, 6),
+                    "residual_pct": round(residual_pct, 1),
+                    "expiry_str":   parsed[1] if len(parsed) == 4 else "?",
+                })
+
+        if not hedge_legs:
+            await update.message.reply_text(
+                f"🎈 *{campaign_name}* — no active hedge positions found.\n"
+                "_Positions may have expired. Campaign can be considered complete._",
+                parse_mode='Markdown'
+            )
+            return
+
+        # ── Recommendation ────────────────────────────────────────────────────
+        min_dte      = min((h["dte"] or 0) for h in hedge_legs)
+        avg_residual = sum(h["residual_pct"] for h in hedge_legs) / len(hedge_legs)
+        action, explanation = recycle_recommendation(min_dte, avg_residual)
+
+        _ROLE_LETTER = {"crash_hedge": "C", "moon_hedge": "D"}
+        action_emoji = {"RECYCLE": "🔄", "ROLL": "↩️", "COAST": "🎈", "CLOSE": "❌"}
+
+        lines = [f"🎈 *{campaign_name}* — COASTING\n", "*Remaining hedges:*"]
+        for h in hedge_legs:
+            letter = _ROLE_LETTER.get(h["role"], "?")
+            lines.append(
+                f"  [{letter}] {h['instr'].split('-')[2]}-{h['instr'].split('-')[3]}  "
+                f"DTE {h['dte']}  "
+                f"Mid {h['current_mid']:.5f}  "
+                f"({h['residual_pct']:.0f}% of entry)"
+            )
+
+        lines.append(
+            f"\n*Recommendation: {action_emoji.get(action, '')} {action}*\n"
+            f"  {explanation}"
+        )
+
+        # ── Buttons based on recommendation ───────────────────────────────────
+        expiry_str = hedge_legs[0]["expiry_str"]
+        context.user_data["recycle_campaign"] = {
+            "name":       campaign_name,
+            "expiry_str": expiry_str,
+            "min_dte":    min_dte,
+        }
+
+        keyboard = []
+        if action == "RECYCLE":
+            lines.append("\n_New shorts will target the same expiry as your existing hedges._")
+            keyboard.append([InlineKeyboardButton("🔄 Find new shorts", callback_data="recycle_find")])
+        elif action == "ROLL":
+            lines.append("\n_Use /suggest to open a fresh campaign in the next available slot._")
+        elif action == "CLOSE":
+            keyboard.append([InlineKeyboardButton("❌ Close all hedges", callback_data=f"recycle_close:{campaign_name}")])
+
+        keyboard.append([
+            InlineKeyboardButton("🎈 Keep coasting", callback_data="noop"),
+        ])
+
+        await update.message.reply_text(
+            "\n".join(lines), parse_mode='Markdown',
+            reply_markup=InlineKeyboardMarkup(keyboard) if keyboard else None
+        )
+    except Exception as e:
+        logger.error(f"Recycle error: {e}", exc_info=True)
+        await update.message.reply_text(f"❌ Error: {e}")
 
 
 async def register(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -975,6 +1112,93 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    if data == "recycle_find":
+        # ── Find new shorts for same expiry as existing hedges ────────────────
+        recycle = context.user_data.get("recycle_campaign")
+        if not recycle:
+            await query.edit_message_text("❌ Session expired. Run /recycle again.")
+            return
+
+        expiry_str = recycle["expiry_str"]   # e.g. "29MAY26"
+        min_dte    = recycle["min_dte"]
+        cam_name   = recycle["name"]
+
+        await query.edit_message_text(f"🔍 Finding 0.10Δ shorts for {expiry_str} expiry...")
+        try:
+            await deribit_client.authenticate()
+            # Use ±5 DTE tolerance around the hedge expiry
+            leg_a = await deribit_client.find_instruments_by_delta(-0.10, min_dte, 'C')
+            leg_b = await deribit_client.find_instruments_by_delta(-0.10, min_dte, 'P')
+
+            # Filter to same expiry
+            leg_a = [l for l in leg_a if expiry_str in l["instrument"]] or leg_a
+            leg_b = [l for l in leg_b if expiry_str in l["instrument"]] or leg_b
+
+            if not leg_a or not leg_b:
+                await query.edit_message_text(
+                    f"❌ Could not find 0.10Δ instruments for {expiry_str}.\n"
+                    "Try /buy and /tag manually."
+                )
+                return
+
+            lines = [
+                f"🔄 *New Shorts for {cam_name}* (expiry {expiry_str})\n",
+                f"• A (Call): {leg_a[0]['instrument']}  Δ {leg_a[0]['delta']:+.3f}",
+                f"  Bid {leg_a[0]['bid']}  Ask {leg_a[0]['ask']}",
+                f"• B (Put):  {leg_b[0]['instrument']}  Δ {leg_b[0]['delta']:+.3f}",
+                f"  Bid {leg_b[0]['bid']}  Ask {leg_b[0]['ask']}",
+                "\n_Hedges already paid for — new premium is near-pure edge._",
+                "_Use /buy + /tag to open these legs and add them to the campaign._",
+            ]
+            await query.edit_message_text("\n".join(lines), parse_mode='Markdown')
+        except Exception as e:
+            await query.edit_message_text(f"❌ Error finding shorts: {e}")
+        return
+
+    if data.startswith("recycle_close:"):
+        cam_name = data.split(":", 1)[1]
+        await query.edit_message_text(f"⏳ Closing all hedge legs in {cam_name}...")
+        try:
+            await deribit_client.authenticate()
+            campaigns = get_all_open_campaigns()
+            campaign  = next((c for c in campaigns if c["name"] == cam_name), None)
+            if not campaign:
+                await query.edit_message_text(f"❌ Campaign {cam_name} not found.")
+                return
+
+            positions = await deribit_client.get_open_positions()
+            pos_map   = {p["instrument_name"]: p for p in positions}
+            results   = []
+
+            for spread in campaign["spreads"]:
+                for leg in spread["legs"]:
+                    instr = leg["instrument_name"]
+                    pos   = pos_map.get(instr)
+                    if not pos or pos.get("size", 0) == 0:
+                        continue
+                    realized_pnl = pos.get("floating_profit_loss", 0)
+                    size = pos["size"]
+                    try:
+                        ticker = await deribit_client.get_ticker(instr)
+                        if size > 0:
+                            price = ticker.get("best_bid_price") or ticker.get("last_price")
+                            await deribit_client.sell(instr, abs(size), price=price, order_type="limit")
+                        else:
+                            price = ticker.get("best_ask_price") or ticker.get("last_price")
+                            await deribit_client.buy(instr, abs(size), price=price, order_type="limit")
+                        close_leg(instr, realized_pnl)
+                        results.append(f"✅ {instr}  PnL {realized_pnl:+.5f} BTC")
+                    except Exception as e:
+                        results.append(f"❌ {instr}: {e}")
+
+            await query.edit_message_text(
+                f"❌ *Hedges Closed — {cam_name}*\n\n" + "\n".join(results),
+                parse_mode='Markdown'
+            )
+        except Exception as e:
+            await query.edit_message_text(f"❌ Error: {e}")
+        return
+
     if data.startswith("close:"):
         instrument = data.split(":", 1)[1]
         await query.edit_message_text(f"⏳ Closing {instrument}...")
@@ -1108,6 +1332,7 @@ def main():
     application.add_handler(CommandHandler("untag",      untag_cmd))
     application.add_handler(CommandHandler("campaigns",  campaigns_cmd))
     application.add_handler(CommandHandler("legs",       legs_cmd))
+    application.add_handler(CommandHandler("recycle",    recycle_cmd))
     application.add_handler(CommandHandler("register",   register))
     application.add_handler(CommandHandler("buy",        trade_cmd))
     application.add_handler(CommandHandler("sell",       trade_cmd))

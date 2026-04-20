@@ -1,6 +1,6 @@
 from typing import List, Dict, Any
 from datetime import datetime, UTC
-from database.queries import get_leg_info, get_realized_pnl_for_spread
+from database.queries import get_leg_info, get_realized_pnl_for_spread, get_all_open_campaigns
 from database.models import ROLE_LABELS
 
 
@@ -236,6 +236,13 @@ class AIRSAnalyzer:
             "crash_hedge": "C", "moon_hedge": "D",
         }
 
+        # Build phase map for all open campaigns (uses live positions already in hand)
+        open_campaigns   = get_all_open_campaigns()
+        phase_map: Dict[str, str] = {
+            c["name"]: detect_campaign_phase(c, self.positions)
+            for c in open_campaigns
+        }
+
         campaigns: Dict[str, Dict[str, list]] = {}
         action_msgs = []
         for d in directives:
@@ -267,7 +274,12 @@ class AIRSAnalyzer:
 
             real_str = (f"  (Float {cam_float:+.5f} | Real {cam_realized:+.5f})"
                         if cam_realized != 0 else "")
-            report.append(f"\n*{cam_name}*  Δ {cam_delta:+.3f}  PnL {cam_total:+.5f} BTC")
+            phase     = phase_map.get(cam_name, "INITIATED")
+            ph_emoji  = _PHASE_EMOJI.get(phase, "")
+            report.append(
+                f"\n*{cam_name}*  {ph_emoji} {phase}  "
+                f"Δ {cam_delta:+.3f}  PnL {cam_total:+.5f} BTC"
+            )
             if real_str:
                 report.append(real_str)
 
@@ -325,6 +337,15 @@ class AIRSAnalyzer:
                     if status == "ROLL" or dte <= 7:
                         report.append(f"       ↳ {d['directive']}")
 
+        # ── COASTING action prompt ─────────────────────────────────────────────
+        coasting = [name for name, ph in phase_map.items() if ph == "COASTING"]
+        if coasting:
+            report.append("\n*⚠️ Action Required — Coasting Campaigns:*")
+            for name in coasting:
+                report.append(f"  🎈 *{name}*: shorts harvested, hedges still active.")
+                report.append(f"     → /recycle {name}  to add new yield legs")
+                report.append(f"       or let hedges expire")
+
         return "\n".join(report)
 
     def get_report_data(self) -> Dict[str, Any]:
@@ -332,3 +353,69 @@ class AIRSAnalyzer:
             "text": self.generate_report(),
             "directives": self.analyze_positions(),
         }
+
+
+# ── Campaign lifecycle helpers (module-level, no DB access) ───────────────────
+
+_SHORT_ROLES = {"yield_call", "yield_put"}
+_HEDGE_ROLES  = {"crash_hedge", "moon_hedge"}
+_ALL_ROLES    = _SHORT_ROLES | _HEDGE_ROLES
+
+_PHASE_EMOJI = {
+    "INITIATED": "🟢",
+    "HARVESTED": "🟡",
+    "COASTING":  "🎈",
+    "RECYCLED":  "🔄",
+    "EMPTY":     "⬜",
+}
+
+
+def detect_campaign_phase(campaign: dict, live_positions: list) -> str:
+    """
+    Derive campaign phase from live position set vs tagged legs.
+    No DB access — works purely from the dicts returned by get_all_open_campaigns()
+    and get_open_positions().
+
+    INITIATED  — all 4 roles have a live position
+    HARVESTED  — at least one short AND at least one hedge live, but not all 4 present
+    COASTING   — no shorts live, at least one hedge live
+    EMPTY      — no tagged legs have a live position
+    """
+    live = {p["instrument_name"] for p in live_positions if p.get("size", 0) != 0}
+    tagged = {
+        leg["instrument_name"]: leg["role"]
+        for spread in campaign.get("spreads", [])
+        for leg in spread.get("legs", [])
+    }
+
+    active_roles = {role for instr, role in tagged.items() if instr in live}
+
+    if not active_roles:
+        return "EMPTY"
+    if _ALL_ROLES <= active_roles:
+        return "INITIATED"
+    if not (active_roles & _SHORT_ROLES) and (active_roles & _HEDGE_ROLES):
+        return "COASTING"
+    return "HARVESTED"   # some mix of shorts/hedges, but not all 4
+
+
+def recycle_recommendation(min_dte: int, avg_residual_pct: float) -> tuple:
+    """
+    Given the minimum DTE across hedge legs and their average residual value
+    (current mid / entry cost × 100), return (action, explanation).
+
+    Actions: RECYCLE | ROLL | COAST | CLOSE
+    """
+    if min_dte >= 21 and avg_residual_pct > 20:
+        return ("RECYCLE",
+                f"{min_dte} DTE, hedges at {avg_residual_pct:.0f}% value — "
+                "add new yield shorts against existing hedges")
+    if min_dte >= 14:
+        return ("ROLL",
+                f"{min_dte} DTE, hedges at {avg_residual_pct:.0f}% — "
+                "hedges too decayed to re-short; start a fresh campaign instead")
+    if min_dte >= 7:
+        return ("COAST",
+                f"{min_dte} DTE — too close to expiry to take on new short gamma")
+    return ("CLOSE",
+            f"{min_dte} DTE — let hedges expire worthless or close for scraps")
