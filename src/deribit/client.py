@@ -178,11 +178,13 @@ class DeribitClient:
         results = []
         for name, strike in matches[:50]:
             ticker = await self._get("public/ticker", {"instrument_name": name})
-            delta = ticker.get("greeks", {}).get("delta", 0)
+            greeks = ticker.get("greeks", {})
+            delta  = greeks.get("delta", 0)
             if delta != 0:
                 results.append({
                     "instrument": name,
                     "delta": delta,
+                    "gamma": greeks.get("gamma", 0),
                     "bid": ticker.get("best_bid_price", 0),
                     "ask": ticker.get("best_ask_price", 0),
                 })

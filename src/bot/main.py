@@ -42,6 +42,8 @@ MARGIN_ALERT_PCT   = 40.0   # critical — send Telegram alert
 SPREAD_WARN_PCT    = 25.0   # bid/ask spread as % of mid — warn user
 SPREAD_BLOCK_PCT   = 80.0   # bid/ask spread — block execution (no real market)
 HARVEST_TARGET_PCT = 50.0   # alert when short leg profit >= this % of entry credit
+YIELD_BLOCK_PCT    = 5.0    # annualised net yield % — block initiation below this
+YIELD_CAUTION_PCT  = 10.0   # annualised net yield % — caution below this
 
 # Track harvest alerts sent this session — prevents re-alerting every 15 min
 _harvest_alerted: set = set()
@@ -691,6 +693,36 @@ async def suggest_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"  Total: {_fmt_credit(total_credit)}",
         ]
 
+        # ── Structure checks ──────────────────────────────────────────────────
+        # Convexity: long gamma (C+D) must exceed short gamma (A+B)
+        long_gamma  = leg_c[0]['gamma'] * sz_c + leg_d[0]['gamma'] * sz_d
+        short_gamma = leg_a[0]['gamma'] * sz_a + leg_b[0]['gamma'] * sz_b
+        convexity   = (long_gamma / short_gamma) if short_gamma > 0 else 0.0
+
+        # Annualised yield on the campaign allocation
+        ann_yield = (total_credit / scale) * (365 / target_dte) * 100 if scale > 0 and total_credit > 0 else 0.0
+
+        conv_ok        = convexity >= 1.0
+        yield_hard_ok  = ann_yield >= YIELD_BLOCK_PCT
+        yield_caution  = yield_hard_ok and ann_yield < YIELD_CAUTION_PCT
+
+        if conv_ok:
+            conv_icon = "✅"
+        else:
+            conv_icon = "❌"
+
+        if ann_yield < YIELD_BLOCK_PCT:
+            yield_icon = "❌"
+        elif ann_yield < YIELD_CAUTION_PCT:
+            yield_icon = "⚠️"
+        else:
+            yield_icon = "✅"
+
+        report.append("\n*Structure Checks:*")
+        report.append(f"  Convexity Ly/Sy  = {convexity:.2f}  {conv_icon}  (target > 1.0)")
+        report.append(f"  Annual yield     = {ann_yield:.1f}%  {yield_icon}  "
+                      f"(block < {YIELD_BLOCK_PCT:.0f}%  caution < {YIELD_CAUTION_PCT:.0f}%)")
+
         # ── Readiness block ───────────────────────────────────────────────────
         report.append(f"\n*Market Readiness: {readiness['emoji']} {readiness['level']}*")
         if readiness["reasons"]:
@@ -699,13 +731,25 @@ async def suggest_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if readiness["spot_move_24h"] is not None:
             report.append(f"  24h spot move: {readiness['spot_move_24h']:.1f}%")
 
+        # ── Gate summary ──────────────────────────────────────────────────────
+        hard_blocks = []
         if total_credit < 0:
-            report.append("\n❌ *Net DEBIT — do not initiate. Adjust strikes or sizing.*")
+            hard_blocks.append("Net debit — adjust strikes or sizing")
+        if not conv_ok:
+            hard_blocks.append(f"Convexity {convexity:.2f} < 1.0 — size hedges larger or move them closer to spot")
+        if not yield_hard_ok:
+            hard_blocks.append(f"Annualised yield {ann_yield:.1f}% < {YIELD_BLOCK_PCT:.0f}% — premium too thin for the risk")
+
+        can_initiate = len(hard_blocks) == 0
+
+        if hard_blocks:
+            report.append("\n❌ *Cannot initiate — fix the following:*")
+            for b in hard_blocks:
+                report.append(f"  • {b}")
+        elif yield_caution or readiness["level"] == "CAUTION":
+            report.append("\n⚠️ *Proceed with caution.* Pre-flight check runs before any order is placed.")
         else:
-            if readiness["level"] == "CAUTION":
-                report.append("\n⚠️ *Proceed with caution.* Pre-flight check runs before any order is placed.")
-            else:
-                report.append("\n_Pre-flight check runs before any order is placed._")
+            report.append("\n✅ *Structure looks good.* Pre-flight check runs before any order is placed.")
 
         context.user_data["last_suggestion"] = {
             "leg_a": leg_a[0]['instrument'],
@@ -719,10 +763,10 @@ async def suggest_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         keyboard = [[InlineKeyboardButton(
             f"🚀 Initiate Slot {open_slot['number']} – {open_slot['label']}",
             callback_data="init_airs"
-        )]]
+        )]] if can_initiate else None
         await update.message.reply_text(
             "\n".join(report), parse_mode='Markdown',
-            reply_markup=InlineKeyboardMarkup(keyboard) if total_credit >= 0 else None
+            reply_markup=InlineKeyboardMarkup(keyboard) if keyboard else None
         )
     except Exception as e:
         logger.error(f"Error finding suggestions: {e}")
