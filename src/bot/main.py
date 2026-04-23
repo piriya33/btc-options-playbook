@@ -289,7 +289,7 @@ async def _check_alerts(context: ContextTypes.DEFAULT_TYPE):
                 continue  # already alerted (persisted across restarts)
 
             entry_credit = abs(pos.get("average_price", 0))
-            floating_pnl = pos.get("floating_profit_loss", 0)
+            floating_pnl = pos["size"] * (pos.get("mark_price", 0) - pos.get("average_price", 0))
             if entry_credit <= 0:
                 continue
 
@@ -703,8 +703,8 @@ async def close_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not pos:
             await update.message.reply_text(f"❌ No open position for {instrument}")
             return
-        realized_pnl = pos.get("floating_profit_loss", 0)
         size = pos["size"]
+        average_price = pos.get("average_price", 0)
         ticker = await deribit_client.get_ticker(instrument)
         if size > 0:
             price = ticker.get("best_bid_price") or ticker.get("last_price")
@@ -712,6 +712,7 @@ async def close_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             price = ticker.get("best_ask_price") or ticker.get("last_price")
             res = await deribit_client.buy(instrument, abs(size), price=price, order_type="limit")
+        realized_pnl = size * ((price or 0) - average_price)
         order = res.get("order", {})
 
         # Record realized PnL and clear harvest alert flag
@@ -1084,11 +1085,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             for pos in short_legs:
                 instr        = pos["instrument_name"]
                 size         = pos["size"]
-                realized_pnl = pos.get("floating_profit_loss", 0)
+                average_price = pos.get("average_price", 0)
                 try:
                     ticker = await deribit_client.get_ticker(instr)
                     price  = ticker.get("best_ask_price") or ticker.get("last_price")
                     res    = await deribit_client.buy(instr, abs(size), price=price, order_type="limit")
+                    realized_pnl = size * ((price or 0) - average_price)
                     close_leg(instr, realized_pnl)
                     results.append(f"✅ Closed {instr}  PnL: {realized_pnl:+.5f} BTC")
                 except Exception as e:
@@ -1176,8 +1178,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     pos   = pos_map.get(instr)
                     if not pos or pos.get("size", 0) == 0:
                         continue
-                    realized_pnl = pos.get("floating_profit_loss", 0)
                     size = pos["size"]
+                    average_price = pos.get("average_price", 0)
                     try:
                         ticker = await deribit_client.get_ticker(instr)
                         if size > 0:
@@ -1186,6 +1188,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         else:
                             price = ticker.get("best_ask_price") or ticker.get("last_price")
                             await deribit_client.buy(instr, abs(size), price=price, order_type="limit")
+                        realized_pnl = size * ((price or 0) - average_price)
                         close_leg(instr, realized_pnl)
                         results.append(f"✅ {instr}  PnL {realized_pnl:+.5f} BTC")
                     except Exception as e:
@@ -1209,8 +1212,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if not pos:
                 await query.edit_message_text(f"❌ No open position for {instrument}")
                 return
-            realized_pnl = pos.get("floating_profit_loss", 0)
             size = pos["size"]
+            average_price = pos.get("average_price", 0)
             ticker = await deribit_client.get_ticker(instrument)
             if size > 0:
                 price = ticker.get("best_bid_price") or ticker.get("last_price")
@@ -1218,6 +1221,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 price = ticker.get("best_ask_price") or ticker.get("last_price")
                 res = await deribit_client.buy(instrument, abs(size), price=price, order_type="limit")
+            realized_pnl = size * ((price or 0) - average_price)
             order = res.get("order", {})
 
             pnl_msg = ""
@@ -1249,8 +1253,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if not pos:
                     results.append(f"ℹ️ {instr}: no open position")
                     continue
-                realized_pnl = pos.get("floating_profit_loss", 0)
                 size = pos["size"]
+                average_price = pos.get("average_price", 0)
                 try:
                     ticker = await deribit_client.get_ticker(instr)
                     if size > 0:
@@ -1259,6 +1263,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     else:
                         price = ticker.get("best_ask_price") or ticker.get("last_price")
                         await deribit_client.buy(instr, abs(size), price=price, order_type="limit")
+                    realized_pnl = size * ((price or 0) - average_price)
                     close_leg(instr, realized_pnl)
                     role_label = ROLE_LABELS.get(leg["role"], leg["role"])
                     results.append(f"✅ [{role_label}] {instr}  PnL: {realized_pnl:+.5f} BTC")

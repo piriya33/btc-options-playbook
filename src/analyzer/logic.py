@@ -67,7 +67,7 @@ class AIRSAnalyzer:
             raw_delta = pos.get("delta", 0)
             contract_delta = raw_delta / size if size != 0 else 0
             gamma = pos.get("gamma", 0)
-            pnl = pos.get("floating_profit_loss", 0)
+            pnl = size * (pos.get("mark_price", 0) - pos.get("average_price", 0))
             leg_info = get_leg_info(instrument)
             parsed = self._parse_instrument(instrument)
             if not parsed:
