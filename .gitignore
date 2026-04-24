@@ -25,6 +25,11 @@ build/
 check_positions.py
 test_deribit.py
 
+# Editor temp files (Claude Code, vim, etc.)
+*.tmp.*
+*.tmp
+*.bak
+
 # OS
 .DS_Store
 Thumbs.db

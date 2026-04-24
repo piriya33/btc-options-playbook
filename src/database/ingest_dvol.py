@@ -12,11 +12,12 @@ whether the bot is running against testnet or mainnet.
 """
 
 import csv
+import glob
 import logging
 import httpx
 from datetime import datetime, UTC
 
-from database.queries import upsert_dvol_candles, get_latest_dvol_date
+from database.queries import upsert_dvol_candles, get_latest_dvol_date, get_dvol_row_count
 
 logger = logging.getLogger(__name__)
 
@@ -99,21 +100,50 @@ def ingest_csv(filepath: str) -> int:
     return len(candles)
 
 
+# ── CSV seeding ───────────────────────────────────────────────────────────────
+
+def seed_from_csvs(folder: str = ".") -> int:
+    """
+    Ingest all DERIBIT_DVOL*.csv files found in `folder` into DVOLHistory.
+    Idempotent — safe to call when rows already exist (upsert by date).
+    Returns total rows written across all files.
+    """
+    pattern = f"{folder}/DERIBIT_DVOL*.csv"
+    files   = sorted(glob.glob(pattern))
+    if not files:
+        logger.debug(f"No DVOL CSV files found matching {pattern}")
+        return 0
+
+    total = 0
+    for path in files:
+        n = ingest_csv(path)
+        total += n
+        logger.info(f"DVOL CSV seed: {n} rows from {path}")
+    return total
+
+
 # ── Startup helper ─────────────────────────────────────────────────────────────
 
 async def ensure_dvol_history() -> str:
     """
-    Called at bot startup. Backfills 30d if the DB has no data or is >1 day stale.
+    Called at bot startup.
+    1. Seeds from any DERIBIT_DVOL*.csv files in cwd if history is sparse (<100 rows).
+    2. Always backfills the last 32 days from Deribit API to get the most recent candles.
     Returns a human-readable status string for the startup log.
     """
-    latest = get_latest_dvol_date()
-    if latest is None:
-        count = await backfill_dvol_30d()
-        return f"DVOL DB was empty — backfilled {count} days"
+    seeded = 0
+    if get_dvol_row_count() < 100:
+        seeded = seed_from_csvs(".")
+        logger.info(f"DVOL seed: {seeded} rows from CSV files")
 
-    days_stale = (datetime.now(UTC).replace(tzinfo=None) - latest).days
+    latest     = get_latest_dvol_date()
+    days_stale = (datetime.now(UTC).replace(tzinfo=None) - latest).days if latest else 999
+
     if days_stale > 1:
         count = await backfill_dvol_30d()
-        return f"DVOL was {days_stale}d stale — backfilled {count} days"
+        if seeded:
+            return f"DVOL: seeded {seeded} rows from CSV + backfilled {count} days from API"
+        return f"DVOL was {days_stale}d stale — backfilled {count} days from API"
 
-    return f"DVOL up to date (latest: {latest.date()})"
+    csv_note = f" (+ {seeded} CSV rows ingested)" if seeded else ""
+    return f"DVOL up to date (latest: {latest.date()}){csv_note}"

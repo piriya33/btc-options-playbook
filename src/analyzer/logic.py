@@ -11,7 +11,11 @@ class AIRSAnalyzer:
         self.spot_price = spot_price
         self.positions = positions
         self.account_summary = account_summary or {}
-        self.iv_data = iv_data or {"rank": 0.0, "current": 0.0, "min": 0.0, "max": 0.0}
+        self.iv_data = iv_data or {
+            "current": 0.0, "rank": 0.0,
+            "rank_30d": 0.0, "min_30d": 0.0, "max_30d": 0.0,
+            "rank_252d": 0.0, "min_252d": 0.0, "max_252d": 0.0,
+        }
         self.initial_equity = initial_equity
 
     def analyze_margin(self) -> Dict[str, Any]:
@@ -186,10 +190,15 @@ class AIRSAnalyzer:
 
         # ── Header ────────────────────────────────────────────────────────────
         report.append("📊 *AIRS Morning Briefing*")
-        report.append(f"Spot: ${self.spot_price:,.2f}  |  IV Rank: {self.iv_data['rank']}%")
+        iv = self.iv_data
         report.append(
-            f"  └ DVOL: {self.iv_data['current']} "
-            f"(30d {self.iv_data['min']}–{self.iv_data['max']})"
+            f"Spot: ${self.spot_price:,.2f}  |  "
+            f"IV Rank: 30d={iv.get('rank_30d', iv['rank'])}%  1y={iv.get('rank_252d', iv['rank'])}%"
+        )
+        report.append(
+            f"  └ DVOL: {iv['current']}  "
+            f"(30d {iv.get('min_30d',0):.1f}–{iv.get('max_30d',0):.1f}  "
+            f"/ 1y {iv.get('min_252d',0):.1f}–{iv.get('max_252d',0):.1f})"
         )
         report.append(
             f"Equity: {equity} BTC  |  "

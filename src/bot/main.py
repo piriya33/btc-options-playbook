@@ -17,8 +17,9 @@ from database.models import ROLE_LABELS
 
 from database.session import init_db
 from database.queries import (
-    get_iv_rank_30d,
+    get_iv_ranks,
     get_initial_btc_equity,
+    set_initial_btc_equity,
     tag_instrument,
     untag_instrument,
     close_leg,
@@ -37,7 +38,7 @@ from database.ingest_dvol import ensure_dvol_history, ingest_yesterday_dvol
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-deribit_client = DeribitClient(testnet=True)
+deribit_client = DeribitClient(testnet=False)
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 DELTA_DRIFT_LIMIT  = 0.15
@@ -144,6 +145,7 @@ async def _market_readiness_score(iv_rank: float, margin_pct: float) -> dict:
     """
     Composite gate for /suggest.
     Levels: GO 🟢 / CAUTION 🟡 / AVOID 🔴
+    iv_rank is the 252d (1-year) IV rank — the strategic gate.
     Block triggers  → AVOID:   IV rank < 20  or margin > MARGIN_WARN_PCT
     Warn triggers   → CAUTION: IV rank > 80  or spot 24h move > 10%
     """
@@ -196,7 +198,7 @@ async def _fetch_data():
     current_dvol    = await deribit_client.get_dvol()
     positions       = await deribit_client.get_open_positions()
     account_summary = await deribit_client.get_account_summary()
-    iv_data         = get_iv_rank_30d(current_dvol)
+    iv_data         = get_iv_ranks(current_dvol)
     initial_equity  = get_initial_btc_equity()
     return spot_price, positions, account_summary, iv_data, initial_equity
 
@@ -326,15 +328,44 @@ async def _check_alerts(context: ContextTypes.DEFAULT_TYPE):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     await update.message.reply_html(
-        rf"Hi {user.mention_html()}! I am AIRY, your AIRS playbook bot.<br/>"
-        "<b>Market:</b> /morning /status /suggest /iv /fear_greed<br/>"
-        "<b>Trading:</b> /buy /sell /close<br/>"
-        "<b>Campaigns:</b> /campaigns /legs /recycle<br/>"
-        "<b>Tagging:</b> /tag &lt;instrument&gt; &lt;role&gt; &lt;campaign&gt; | /untag &lt;instrument&gt;<br/>"
-        "  Roles: A=yield_call  B=yield_put  C=crash_hedge  D=moon_hedge<br/>"
-        "  Example: <code>/tag BTC-27JUN25-100000-C A MAY2026</code><br/>"
-        "<b>Settings:</b> /register"
+        rf"Hi {user.mention_html()}! I'm AIRY, your AIRS options playbook bot. "
+        "Type /help for the full command list."
     )
+
+
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (
+        "<b>📋 AIRY Command Reference</b>\n"
+        "\n"
+        "<b>── Market ──</b>\n"
+        "/morning — Full AIRS morning briefing (positions + directives)\n"
+        "/status — Live portfolio snapshot\n"
+        "/suggest — Find next AIRS campaign slot + pre-trade gates\n"
+        "/iv — Volatility intelligence (DVOL, IV rank 30d/1y, RV, premium)\n"
+        "/fear_greed — Bitcoin Fear &amp; Greed index\n"
+        "\n"
+        "<b>── Trading ──</b>\n"
+        "/buy &lt;instrument&gt; &lt;size&gt; — Place a market buy\n"
+        "/sell &lt;instrument&gt; &lt;size&gt; — Place a market sell\n"
+        "/close &lt;instrument&gt; — Close a position at market\n"
+        "\n"
+        "<b>── Campaigns ──</b>\n"
+        "/campaigns — List all open campaigns with PnL\n"
+        "/legs &lt;campaign&gt; — Show all tagged legs for a campaign\n"
+        "/recycle &lt;campaign&gt; — Phase check + recycle/roll/coast/close recommendation\n"
+        "\n"
+        "<b>── Tagging ──</b>\n"
+        "/tag &lt;instrument&gt; &lt;role&gt; &lt;campaign&gt; — Assign an instrument to a campaign\n"
+        "  Roles: <code>A</code>=yield_call  <code>B</code>=yield_put  "
+        "<code>C</code>=crash_hedge  <code>D</code>=moon_hedge\n"
+        "  Example: <code>/tag BTC-27JUN25-100000-C A MAY2026</code>\n"
+        "/untag &lt;instrument&gt; — Remove a tag\n"
+        "\n"
+        "<b>── Settings ──</b>\n"
+        "/register — Subscribe to daily 08:00 UTC morning briefing\n"
+        "/setbaseline [btc_equity] — View or update Satoshi Growth baseline\n"
+    )
+    await update.message.reply_html(text)
 
 
 async def morning(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -377,7 +408,7 @@ async def iv_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Fetching volatility data... ⏳")
     try:
         dvol = await deribit_client.get_dvol()
-        iv_data = get_iv_rank_30d(dvol)
+        iv_data = get_iv_ranks(dvol)
 
         rv_url = "https://api.coingecko.com/api/v3/coins/bitcoin/market_chart?vs_currency=usd&days=30&interval=daily"
         async with httpx.AsyncClient(timeout=8.0) as client:
@@ -393,12 +424,19 @@ async def iv_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines = [
             "📐 *Volatility Intelligence*",
             f"• DVOL (Implied): *{dvol:.2f}*",
-            f"• 30d IV Rank: *{iv_data['rank']}%* (Range: {iv_data['min']} – {iv_data['max']})",
+            f"• IV Rank 30d:  *{iv_data['rank_30d']}%*  (range {iv_data['min_30d']} – {iv_data['max_30d']})",
+            f"• IV Rank 1yr:  *{iv_data['rank_252d']}%*  (range {iv_data['min_252d']} – {iv_data['max_252d']})",
         ]
         if realised_vol:
             vol_premium = dvol - realised_vol
-            verdict = ("🟢 *Options CHEAP* — IV < RV. Good time to BUY hedges." if vol_premium < 0
-                       else f"🔴 *Options EXPENSIVE* — IV premium: +{vol_premium:.1f} pts. Good time to SELL yield.")
+            if vol_premium < -3:
+                verdict = "🟢 *Options CHEAP* — IV well below RV. Good time to BUY hedges."
+            elif vol_premium < 3:
+                verdict = f"⚪ *Options FAIR* — IV/RV spread within noise ({vol_premium:+.1f} pts). No strong vol signal."
+            elif vol_premium < 8:
+                verdict = f"🔴 *Options EXPENSIVE* — IV premium: +{vol_premium:.1f} pts. Good time to SELL yield."
+            else:
+                verdict = f"🔴 *Options RICH* — IV premium: +{vol_premium:.1f} pts. Strong sell signal, but watch for vol crush."
             lines.append(f"• 30d Realised Vol: *{realised_vol:.2f}*")
             lines.append(f"• IV Premium: *{vol_premium:+.2f}* pts")
             lines.append(f"\n{verdict}")
@@ -654,6 +692,51 @@ async def register(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("✅ Registered! Daily Morning Briefing at 08:00 UTC.")
 
 
+async def setbaseline_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /setbaseline <btc_equity>   — overwrite the Satoshi Growth baseline.
+    /setbaseline                 — show current baseline + live equity, no write.
+    """
+    current = get_initial_btc_equity()
+
+    if not context.args:
+        try:
+            _, _, account_summary, _, _ = await _fetch_data()
+            live_equity = float(account_summary.get("equity", 0.0))
+            msg = (
+                f"Current baseline: `{current:.6f}` BTC\n"
+                f"Live equity:      `{live_equity:.6f}` BTC\n\n"
+                f"To update: `/setbaseline {live_equity:.6f}`"
+            )
+        except Exception as e:
+            msg = (
+                f"Current baseline: `{current:.6f}` BTC\n\n"
+                f"Usage: `/setbaseline <btc_equity>`\n"
+                f"(couldn't fetch live equity: {e})"
+            )
+        await update.message.reply_text(msg, parse_mode='Markdown')
+        return
+
+    try:
+        new_value = float(context.args[0])
+    except ValueError:
+        await update.message.reply_text(
+            "❌ Value must be a number, e.g. `/setbaseline 0.12345`",
+            parse_mode='Markdown',
+        )
+        return
+
+    if new_value <= 0:
+        await update.message.reply_text("❌ Baseline must be positive.")
+        return
+
+    set_initial_btc_equity(new_value)
+    await update.message.reply_text(
+        f"✅ Baseline updated: `{current:.6f}` → `{new_value:.6f}` BTC",
+        parse_mode='Markdown',
+    )
+
+
 async def scheduled_morning_push(context: ContextTypes.DEFAULT_TYPE):
     chat_id = get_morning_push_chat_id()
     if chat_id:
@@ -739,8 +822,8 @@ async def suggest_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # ── Market Readiness Score ────────────────────────────────────────────
         current_dvol = await deribit_client.get_dvol()
-        iv_data      = get_iv_rank_30d(current_dvol)
-        readiness    = await _market_readiness_score(iv_data["rank"], margin_pct)
+        iv_data      = get_iv_ranks(current_dvol)
+        readiness    = await _market_readiness_score(iv_data["rank_252d"], margin_pct)
 
         if readiness["level"] == "AVOID":
             lines = [
@@ -1331,6 +1414,7 @@ def main():
     )
 
     application.add_handler(CommandHandler("start",      start))
+    application.add_handler(CommandHandler("help",       help_cmd))
     application.add_handler(CommandHandler("morning",    morning))
     application.add_handler(CommandHandler("status",     status))
     application.add_handler(CommandHandler("tag",        tag_cmd))
@@ -1339,6 +1423,7 @@ def main():
     application.add_handler(CommandHandler("legs",       legs_cmd))
     application.add_handler(CommandHandler("recycle",    recycle_cmd))
     application.add_handler(CommandHandler("register",   register))
+    application.add_handler(CommandHandler("setbaseline",setbaseline_cmd))
     application.add_handler(CommandHandler("buy",        trade_cmd))
     application.add_handler(CommandHandler("sell",       trade_cmd))
     application.add_handler(CommandHandler("close",      close_cmd))

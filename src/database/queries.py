@@ -43,38 +43,51 @@ def upsert_dvol_candles(candles: list):
 
 # ── DVOL / IV Rank ─────────────────────────────────────────────────────────────
 
-def get_iv_rank_30d(current_dvol: float = None) -> dict:
+def get_dvol_row_count() -> int:
     db = SessionLocal()
     try:
-        thirty_days_ago = datetime.now(UTC).replace(tzinfo=None) - timedelta(days=30)
-        records = db.query(DVOLHistory).filter(DVOLHistory.date >= thirty_days_ago).all()
-
-        if not records and current_dvol is None:
-            return {"rank": 0.0, "current": 0.0, "min": 0.0, "max": 0.0}
-
-        dvols = [r.dvol for r in records]
-        if current_dvol is not None:
-            dvols.append(current_dvol)
-
-        if not dvols:
-            return {"rank": 0.0, "current": 0.0, "min": 0.0, "max": 0.0}
-
-        max_dvol = max(dvols)
-        min_dvol = min(dvols)
-
-        if max_dvol == min_dvol:
-            return {"rank": 50.0, "current": current_dvol, "min": min_dvol, "max": max_dvol}
-
-        latest_dvol = current_dvol if current_dvol is not None else dvols[-1]
-        iv_rank = ((latest_dvol - min_dvol) / (max_dvol - min_dvol)) * 100
-        return {
-            "rank": round(iv_rank, 2),
-            "current": round(latest_dvol, 2),
-            "min": round(min_dvol, 2),
-            "max": round(max_dvol, 2),
-        }
+        return db.query(DVOLHistory).count()
     finally:
         db.close()
+
+
+def _get_iv_rank_for_window(window_days: int, current_dvol: float = None) -> dict:
+    """Internal: compute IV rank over an arbitrary lookback window."""
+    db = SessionLocal()
+    try:
+        cutoff  = datetime.now(UTC).replace(tzinfo=None) - timedelta(days=window_days)
+        records = db.query(DVOLHistory).filter(DVOLHistory.date >= cutoff).all()
+        dvols   = [r.dvol for r in records]
+        if current_dvol is not None:
+            dvols.append(current_dvol)
+        if not dvols:
+            return {"rank": 0.0, "min": 0.0, "max": 0.0}
+        lo, hi = min(dvols), max(dvols)
+        latest = current_dvol if current_dvol is not None else dvols[-1]
+        rank   = ((latest - lo) / (hi - lo) * 100) if hi != lo else 50.0
+        return {"rank": round(rank, 1), "min": round(lo, 2), "max": round(hi, 2)}
+    finally:
+        db.close()
+
+
+def get_iv_ranks(current_dvol: float = None) -> dict:
+    """
+    Return IV rank for both 30d and 252d windows in a single dict.
+    'rank' is aliased to rank_252d (the primary strategic rank).
+    """
+    r30  = _get_iv_rank_for_window(30,  current_dvol)
+    r252 = _get_iv_rank_for_window(252, current_dvol)
+    current = current_dvol if current_dvol is not None else 0.0
+    return {
+        "current":   round(current, 2),
+        "rank_30d":  r30["rank"],
+        "min_30d":   r30["min"],
+        "max_30d":   r30["max"],
+        "rank_252d": r252["rank"],
+        "min_252d":  r252["min"],
+        "max_252d":  r252["max"],
+        "rank":      r252["rank"],   # primary rank = 1-year window
+    }
 
 
 # ── App Settings ───────────────────────────────────────────────────────────────
@@ -84,6 +97,20 @@ def get_initial_btc_equity() -> float:
     try:
         setting = db.query(AppSettings).filter(AppSettings.key == 'initial_btc_equity').first()
         return setting.value if setting else 1.0
+    finally:
+        db.close()
+
+
+def set_initial_btc_equity(value: float):
+    """Upsert the Satoshi Growth baseline (BTC-denominated equity at t0)."""
+    db = SessionLocal()
+    try:
+        setting = db.query(AppSettings).filter(AppSettings.key == 'initial_btc_equity').first()
+        if setting:
+            setting.value = float(value)
+        else:
+            db.add(AppSettings(key='initial_btc_equity', value=float(value)))
+        db.commit()
     finally:
         db.close()
 
