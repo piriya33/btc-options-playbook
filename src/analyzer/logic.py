@@ -323,11 +323,10 @@ class AIRSAnalyzer:
 
                 # ── Per-leg rows ───────────────────────────────────────────────
                 for d in legs:
-                    letter   = _ROLE_LETTER.get(d.get("role", ""), "?")
-                    strike   = d.get("strike", 0)
-                    opt_type = d.get("opt_type", "?")
-                    dte      = d.get("dte", 0)
-                    status   = d.get("status", "HOLD")
+                    letter = _ROLE_LETTER.get(d.get("role", ""), "?")
+                    instr  = d.get("instrument", "?")
+                    dte    = d.get("dte", 0)
+                    status = d.get("status", "HOLD")
 
                     if status == "ROLL":
                         st_tag = "🔄 ROLL"
@@ -337,7 +336,7 @@ class AIRSAnalyzer:
                         st_tag = "✅"
 
                     report.append(
-                        f"    [{letter}] {strike}-{opt_type}  "
+                        f"    [{letter}] `{instr}`  "
                         f"Δ {d['raw_delta']:+.3f}  "
                         f"PnL {d['raw_pnl']:+.5f}  "
                         f"DTE {dte}  {st_tag}"

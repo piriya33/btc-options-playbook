@@ -3,6 +3,7 @@ import io
 import logging
 import asyncio
 import httpx
+import numpy as np
 from datetime import time, datetime, UTC
 
 from dotenv import load_dotenv
@@ -32,6 +33,8 @@ from database.queries import (
     is_harvest_alerted,
     mark_harvest_alerted,
     clear_harvest_alerted,
+    get_campaign_scale_pct,
+    set_campaign_scale_pct,
 )
 from database.ingest_dvol import ensure_dvol_history, ingest_yesterday_dvol
 
@@ -49,6 +52,7 @@ SPREAD_BLOCK_PCT   = 80.0   # bid/ask spread — block execution (no real market
 HARVEST_TARGET_PCT = 50.0   # alert when short leg profit >= this % of entry credit
 YIELD_BLOCK_PCT    = 5.0    # annualised net yield % — block initiation below this
 YIELD_CAUTION_PCT  = 10.0   # annualised net yield % — caution below this
+IV_PREMIUM_HALF_ENTRY = 2.0 # minimum IV premium (pts) to allow 50% entry when IV rank < 20%
 
 
 
@@ -67,11 +71,26 @@ def _assess_spread(ticker: dict) -> dict:
 def _build_airs_trades(suggestion: dict) -> list:
     """Return the 4-leg trade list from a /suggest suggestion dict."""
     scale = suggestion.get("scale", 1.0)
+    def _sz(ratio: float) -> float:
+        return max(0.1, round(ratio * scale, 1))
     return [
-        {"instr": suggestion["leg_d"], "amount": round(1.0 * scale, 1), "side": "buy",  "role": "moon_hedge"},
-        {"instr": suggestion["leg_c"], "amount": round(0.6 * scale, 1), "side": "buy",  "role": "crash_hedge"},
-        {"instr": suggestion["leg_a"], "amount": round(0.5 * scale, 1), "side": "sell", "role": "yield_call"},
-        {"instr": suggestion["leg_b"], "amount": round(0.2 * scale, 1), "side": "sell", "role": "yield_put"},
+        {"instr": suggestion["leg_d"], "amount": _sz(1.0), "side": "buy",  "role": "moon_hedge"},
+        {"instr": suggestion["leg_c"], "amount": _sz(0.6), "side": "buy",  "role": "crash_hedge"},
+        {"instr": suggestion["leg_a"], "amount": _sz(0.5), "side": "sell", "role": "yield_call"},
+        {"instr": suggestion["leg_b"], "amount": _sz(0.2), "side": "sell", "role": "yield_put"},
+    ]
+
+
+def _get_airs_pairs(trades: list) -> list[list]:
+    """Split the 4 AIRS legs into two spread pairs for sequential execution.
+
+    Pair 1 — call spread: moon_hedge (D) + yield_call (A)
+    Pair 2 — put spread:  crash_hedge (C) + yield_put (B)
+    """
+    by_role = {t["role"]: t for t in trades}
+    return [
+        [by_role["moon_hedge"], by_role["yield_call"]],
+        [by_role["crash_hedge"], by_role["yield_put"]],
     ]
 
 
@@ -120,8 +139,9 @@ def _slot_for_dte(dte: int | None) -> int | None:
 
 def _filled_slots(campaigns: list) -> dict:
     """
-    Return {slot_number: {"name": ..., "dte": ...}} for each open campaign
-    that maps to a recognised slot.
+    Return {slot_number: {"name": ..., "dte": ..., "scale_pct": ...}} for each
+    open campaign that maps to a recognised slot.
+    scale_pct < 100 means the campaign was initiated at half size and can be topped up.
     """
     filled = {}
     for c in campaigns:
@@ -135,21 +155,34 @@ def _filled_slots(campaigns: list) -> dict:
                 break
         slot_num = _slot_for_dte(dte)
         if slot_num and slot_num not in filled:
-            filled[slot_num] = {"name": c["name"], "dte": dte}
+            filled[slot_num] = {
+                "name":      c["name"],
+                "dte":       dte,
+                "scale_pct": get_campaign_scale_pct(c["name"]),
+            }
     return filled
 
 
 # ── Market Readiness Score ─────────────────────────────────────────────────────
 
-async def _market_readiness_score(iv_rank: float, margin_pct: float) -> dict:
+async def _market_readiness_score(
+    iv_rank: float,
+    margin_pct: float,
+    iv_premium: float | None = None,
+) -> dict:
     """
     Composite gate for /suggest.
     Levels: GO 🟢 / CAUTION 🟡 / AVOID 🔴
-    iv_rank is the 252d (1-year) IV rank — the strategic gate.
-    Block triggers  → AVOID:   IV rank < 20  or margin > MARGIN_WARN_PCT
-    Warn triggers   → CAUTION: IV rank > 80  or spot 24h move > 10%
+
+    iv_rank    — 252d (1-year) IV rank, strategic gate
+    iv_premium — DVOL minus 30-day realised vol (pts); unlocks 50% entry at low rank
+
+    Block → AVOID:   IV rank < 20 AND iv_premium < IV_PREMIUM_HALF_ENTRY, or margin > limit
+    Half  → CAUTION: IV rank < 20 BUT iv_premium >= IV_PREMIUM_HALF_ENTRY (half-size allowed)
+    Warn  → CAUTION: IV rank > 80 or spot 24h move > 10%
     """
     level = "GO"
+    half_size = False
     reasons: list[str] = []
     spot_move_24h: float | None = None
 
@@ -163,17 +196,33 @@ async def _market_readiness_score(iv_rank: float, margin_pct: float) -> dict:
         cg = r.json().get("bitcoin", {})
         spot_move_24h = abs(cg.get("usd_24h_change", 0.0))
     except Exception:
-        pass  # non-fatal — we just won't check this signal
+        pass  # non-fatal
 
-    # ── Block conditions ──────────────────────────────────────────────────────
+    # ── Block / half conditions ───────────────────────────────────────────────
     if iv_rank < 20:
-        level = "AVOID"
-        reasons.append(f"IV Rank {iv_rank:.1f}% < 20% — volatility too cheap to sell")
+        if iv_premium is not None and iv_premium >= IV_PREMIUM_HALF_ENTRY:
+            level = "CAUTION"
+            half_size = True
+            reasons.append(
+                f"IV Rank {iv_rank:.1f}% < 20% but IV premium +{iv_premium:.1f} pts — "
+                f"50% half-size entry available (top up when rank improves)"
+            )
+        else:
+            level = "AVOID"
+            reasons.append(
+                f"IV Rank {iv_rank:.1f}% < 20% and IV premium "
+                f"{'+' if (iv_premium or 0) >= 0 else ''}{iv_premium:.1f if iv_premium is not None else 'N/A'} pts "
+                f"< {IV_PREMIUM_HALF_ENTRY:.0f} pts — vol too cheap to sell"
+                if iv_premium is not None else
+                f"IV Rank {iv_rank:.1f}% < 20% — volatility too cheap to sell"
+            )
+
     if margin_pct > MARGIN_WARN_PCT:
         level = "AVOID"
+        half_size = False
         reasons.append(f"Margin {margin_pct:.1f}% > {MARGIN_WARN_PCT:.0f}% — no capacity for new positions")
 
-    # ── Warn conditions (only upgrade to CAUTION if not already blocked) ──────
+    # ── Warn conditions (only if not already blocked) ─────────────────────────
     if level != "AVOID":
         if iv_rank > 80:
             level = "CAUTION"
@@ -186,6 +235,7 @@ async def _market_readiness_score(iv_rank: float, margin_pct: float) -> dict:
     return {
         "level":          level,
         "emoji":          emoji,
+        "half_size":      half_size,
         "reasons":        reasons,
         "spot_move_24h":  spot_move_24h,
     }
@@ -417,7 +467,6 @@ async def iv_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         realised_vol = None
         if len(prices) > 2:
-            import numpy as np
             returns = np.diff(np.log(prices))
             realised_vol = float(np.std(returns) * np.sqrt(365) * 100)
 
@@ -820,10 +869,26 @@ async def suggest_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         equity     = summary.get("equity", 0)
         margin_pct = (summary.get("initial_margin", 0) / equity * 100) if equity > 0 else 0
 
-        # ── Market Readiness Score ────────────────────────────────────────────
+        # ── IV premium (DVOL − 30d realised vol) ─────────────────────────────
         current_dvol = await deribit_client.get_dvol()
         iv_data      = get_iv_ranks(current_dvol)
-        readiness    = await _market_readiness_score(iv_data["rank_252d"], margin_pct)
+        iv_premium: float | None = None
+        try:
+            async with httpx.AsyncClient(timeout=8.0) as client:
+                r = await client.get(
+                    "https://api.coingecko.com/api/v3/coins/bitcoin/market_chart",
+                    params={"vs_currency": "usd", "days": 30, "interval": "daily"},
+                )
+            prices = [p[1] for p in r.json().get("prices", [])]
+            if len(prices) > 2:
+                returns = np.diff(np.log(prices))
+                realised_vol = float(np.std(returns) * np.sqrt(365) * 100)
+                iv_premium   = current_dvol - realised_vol
+        except Exception:
+            pass  # non-fatal — readiness will fall back to rank-only gate
+
+        # ── Market Readiness Score ────────────────────────────────────────────
+        readiness = await _market_readiness_score(iv_data["rank_252d"], margin_pct, iv_premium)
 
         if readiness["level"] == "AVOID":
             lines = [
@@ -837,69 +902,192 @@ async def suggest_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("\n".join(lines), parse_mode='Markdown')
             return
 
-        # ── Determine which slot to fill ──────────────────────────────────────
+        # ── Determine which slot to fill (or top up) ──────────────────────────
         existing  = get_all_open_campaigns()
         filled    = _filled_slots(existing)
 
+        # Half-filled slot takes priority (top up before opening a new one)
+        half_slot = next(
+            (s for s in CAMPAIGN_SLOTS if s["number"] in filled and filled[s["number"]]["scale_pct"] < 100),
+            None,
+        )
         open_slot = next((s for s in CAMPAIGN_SLOTS if s["number"] not in filled), None)
+        target_slot = half_slot or open_slot
 
-        if open_slot is None:
+        if target_slot is None:
             slot_lines = "\n".join(
-                f"  Slot {s['number']} – {s['label']}: ✅ {filled[s['number']]['name']} ({filled[s['number']]['dte']} DTE)"
+                f"  Slot {s['number']} – {s['label']}: ✅ {filled[s['number']]['name']} "
+                f"({filled[s['number']]['dte']} DTE)"
                 for s in CAMPAIGN_SLOTS
             )
             await update.message.reply_text(
-                f"✅ *All 3 campaign slots are active:*\n{slot_lines}\n\n"
+                f"✅ *All 3 campaign slots are fully active:*\n{slot_lines}\n\n"
                 "_No new campaign needed. Monitor existing positions with /status._",
                 parse_mode='Markdown'
             )
             return
 
-        target_dte = open_slot["target_dte"]
-
-        # ── Find legs at the right DTE ────────────────────────────────────────
-        leg_a = await deribit_client.find_instruments_by_delta(-0.10, target_dte, 'C')
-        leg_b = await deribit_client.find_instruments_by_delta(-0.10, target_dte, 'P')
-        leg_c = await deribit_client.find_instruments_by_delta(0.03,  target_dte, 'P')
-        leg_d = await deribit_client.find_instruments_by_delta(0.02,  target_dte, 'C')
-
-        # ── Sizing: equity / 3 per campaign ──────────────────────────────────
-        scale = round(equity / 3, 1)
-
-        # Leg sizes at the AIRS ratios
-        sz_a = round(0.5 * scale, 1)
-        sz_b = round(0.2 * scale, 1)
-        sz_c = round(0.6 * scale, 1)
-        sz_d = round(1.0 * scale, 1)
-
-        # ── Net premium breakdown ─────────────────────────────────────────────
-        call_credit = sz_a * leg_a[0]['bid'] - sz_d * leg_d[0]['ask']
-        put_credit  = sz_b * leg_b[0]['bid'] - sz_c * leg_c[0]['ask']
-        total_credit = call_credit + put_credit
+        is_topup    = half_slot is not None and half_slot == target_slot
+        scale_factor = 0.5 if readiness["half_size"] or is_topup else 1.0
+        target_dte  = target_slot["target_dte"]
 
         def _fmt_credit(val: float) -> str:
-            sign = "+" if val >= 0 else ""
+            sign  = "+" if val >= 0 else ""
             emoji = "✅" if val >= 0 else "⚠️"
             return f"{sign}{round(val, 5)} BTC {emoji}"
 
+        # ── Find (or load) legs ───────────────────────────────────────────────
+        skipped_slots: list[str] = []
+        if is_topup:
+            # Re-use the existing instruments — just add the remaining 50%
+            cam_info = filled[half_slot["number"]]
+            cam_name = cam_info["name"]
+            existing_cam = next((c for c in existing if c["name"] == cam_name), None)
+            role_to_instr: dict[str, str] = {}
+            for spread in existing_cam["spreads"]:
+                for leg in spread["legs"]:
+                    role_to_instr[leg["role"]] = leg["instrument_name"]
+
+            async def _ticker_leg(instr: str) -> dict:
+                t = await deribit_client.get_ticker(instr)
+                g = t.get("greeks", {})
+                return {
+                    "instrument": instr,
+                    "delta":  g.get("delta", 0),
+                    "gamma":  g.get("gamma", 0),
+                    "bid":    t.get("best_bid_price", 0) or 0,
+                    "ask":    t.get("best_ask_price", 0) or 0,
+                }
+
+            leg_a = [await _ticker_leg(role_to_instr["yield_call"])]
+            leg_b = [await _ticker_leg(role_to_instr["yield_put"])]
+            leg_c = [await _ticker_leg(role_to_instr["crash_hedge"])]
+            leg_d = [await _ticker_leg(role_to_instr["moon_hedge"])]
+        else:
+            # Try open slots in order; skip any that have no liquid expiry right now
+            skipped_slots: list[str] = []
+            open_candidates = [s for s in CAMPAIGN_SLOTS if s["number"] not in filled]
+            leg_a = leg_b = leg_c = leg_d = []
+            for candidate in open_candidates:
+                la = await deribit_client.find_instruments_by_delta(
+                    -0.10, candidate["target_dte"], 'C', candidate["dte_min"], candidate["dte_max"])
+                lb = await deribit_client.find_instruments_by_delta(
+                    -0.10, candidate["target_dte"], 'P', candidate["dte_min"], candidate["dte_max"])
+                lc = await deribit_client.find_instruments_by_delta(
+                    0.03,  candidate["target_dte"], 'P', candidate["dte_min"], candidate["dte_max"])
+                ld = await deribit_client.find_instruments_by_delta(
+                    0.02,  candidate["target_dte"], 'C', candidate["dte_min"], candidate["dte_max"])
+                if la and lb and lc and ld:
+                    leg_a, leg_b, leg_c, leg_d = la, lb, lc, ld
+                    target_slot = candidate
+                    target_dte  = candidate["target_dte"]
+                    break
+                skipped_slots.append(
+                    f"Slot {candidate['number']} ({candidate['dte_min']}–{candidate['dte_max']} DTE)"
+                )
+
+            if not leg_a:
+                skipped = ", ".join(skipped_slots) or "all slots"
+                await update.message.reply_text(
+                    f"❌ No liquid instruments found across any open slot ({skipped}).\n"
+                    f"Deribit may have no active expiries in range right now — try again tomorrow.",
+                )
+                return
+
+        # ── Sizing ────────────────────────────────────────────────────────────
+        # Goal: deploy each campaign so that running all 3 simultaneously stays
+        # near but under the MARGIN_WARN_PCT (25%) initial-margin threshold.
+        #
+        # Deribit initial margin for short OTM options ≈ 15% of notional.
+        # The two short legs per campaign are A (0.5× scale) and B (0.2× scale),
+        # so their combined notional = 0.7 × scale BTC.
+        #
+        # Solve for scale that fills the margin budget:
+        #   margin_per_campaign = 0.7 × scale × 0.15
+        #   total_margin (3 campaigns) = 3 × 0.7 × scale × 0.15 = 0.315 × scale × equity⁻¹ ... wait:
+        #
+        #   3 × 0.7 × scale × 0.15 = 0.25 × equity
+        #   scale = 0.25 × equity / (3 × 0.7 × 0.15)
+        #   scale = 0.25 / 0.315 × equity
+        #   scale ≈ 0.794 × equity   →   rounded to 0.79
+        #
+        # Worked example at 0.85 BTC equity, full-size:
+        #   scale = round(0.85 × 0.79, 1) = 0.7
+        #   D 1.0× = 0.7 BTC  C 0.6× = 0.4 BTC  A 0.5× = 0.4 BTC  B 0.2× = 0.1 BTC (min)
+        #   margin used: (0.4 + 0.1) × 0.15 × 3 = 0.225 BTC = 26% ✅
+        #
+        # Worked example at 0.85 BTC equity, half-size (scale_factor = 0.5):
+        #   scale = round(0.85 × 0.79 × 0.5, 1) = 0.3
+        #   D=0.3  C=0.2  A=0.2  B=0.1 (min)
+        #   margin used: (0.2 + 0.1) × 0.15 × 3 = 0.135 BTC = 16% ✅
+        #
+        # Note: 0.15 is the approximate Deribit margin rate for ~10-delta OTM options.
+        # Actual margin will be slightly lower for deeply OTM strikes; monitor the
+        # margin % in /status after deployment and adjust the 0.79 factor if needed.
+        #
+        # scale_factor = 0.5 for half entries or top-ups; 1.0 for full entries
+        # min 0.1 per leg — Deribit's minimum contract size
+        scale = round(equity * 0.79 * scale_factor, 1)
+        sz_a  = max(0.1, round(0.5 * scale, 1))
+        sz_b  = max(0.1, round(0.2 * scale, 1))
+        sz_c  = max(0.1, round(0.6 * scale, 1))
+        sz_d  = max(0.1, round(1.0 * scale, 1))
+
+        # ── Net premium breakdown ─────────────────────────────────────────────
+        call_credit  = sz_a * leg_a[0]['bid'] - sz_d * leg_d[0]['ask']
+        put_credit   = sz_b * leg_b[0]['bid'] - sz_c * leg_c[0]['ask']
+        total_credit = call_credit + put_credit
+
         # ── Slot status lines ─────────────────────────────────────────────────
+        skipped_slot_nums = {int(s.split()[1]) for s in skipped_slots} if not is_topup else set()
         slot_lines = []
         for s in CAMPAIGN_SLOTS:
             if s["number"] in filled:
                 info = filled[s["number"]]
-                slot_lines.append(f"  Slot {s['number']} – {s['label']}: ✅ {info['name']} ({info['dte']} DTE)")
-            elif s["number"] == open_slot["number"]:
+                scale_tag = f" ⚡ {info['scale_pct']:.0f}%" if info["scale_pct"] < 100 else ""
+                if s["number"] == target_slot["number"] and is_topup:
+                    slot_lines.append(
+                        f"  Slot {s['number']} – {s['label']}: 🔼 {info['name']} "
+                        f"({info['dte']} DTE){scale_tag} → *topping up to 100%*"
+                    )
+                else:
+                    slot_lines.append(
+                        f"  Slot {s['number']} – {s['label']}: ✅ {info['name']} "
+                        f"({info['dte']} DTE){scale_tag}"
+                    )
+            elif s["number"] == target_slot["number"]:
                 slot_lines.append(f"  Slot {s['number']} – {s['label']}: 👉 *Suggesting now*")
+            elif s["number"] in skipped_slot_nums:
+                slot_lines.append(f"  Slot {s['number']} – {s['label']}: ⏭ _(skipped — no liquid expiry)_")
             else:
                 slot_lines.append(f"  Slot {s['number']} – {s['label']}: ⬜ Empty")
 
+        if is_topup:
+            size_note = (
+                f"⚖️ Top-up allocation: {scale} BTC  "
+                f"(adding remaining 50% to {cam_info['name']})"
+            )
+            header = (
+                f"🔼 *AIRS Top-Up — Slot {target_slot['number']}: {target_slot['label']}*\n"
+                f"Campaign: {cam_info['name']}  ({cam_info['dte']} DTE remaining)\n"
+            )
+        else:
+            size_note = (
+                f"⚖️ Campaign allocation: {scale} BTC  "
+                f"({'50% half-size' if scale_factor == 0.5 else 'full size'}  equity ÷ 3"
+                f"{' × 0.5' if scale_factor == 0.5 else ''})"
+            )
+            header = (
+                f"🚀 *AIRS Suggestion — Slot {target_slot['number']}: {target_slot['label']}*\n"
+                f"Target: ~{target_dte} DTE\n"
+            )
+
         report = [
-            f"🚀 *AIRS Suggestion — Slot {open_slot['number']}: {open_slot['label']}*",
-            f"Target: ~{target_dte} DTE\n",
+            header,
             "*Campaign Slots:*",
             *slot_lines,
             f"\n💰 Equity: {round(equity, 4)} BTC",
-            f"⚖️ Campaign allocation: {scale} BTC (equity ÷ 3)",
+            size_note,
             "\n*Yield Legs (Short):*",
             f"• A (Call): {leg_a[0]['instrument']} (Δ: {round(leg_a[0]['delta'], 2)})",
             f"  └ Size: {sz_a} | Bid: {leg_a[0]['bid']} | Ask: {leg_a[0]['ask']}",
@@ -918,34 +1106,16 @@ async def suggest_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ]
 
         # ── Structure checks ──────────────────────────────────────────────────
-        # Convexity: long gamma (C+D) must exceed short gamma (A+B)
-        long_gamma  = leg_c[0]['gamma'] * sz_c + leg_d[0]['gamma'] * sz_d
-        short_gamma = leg_a[0]['gamma'] * sz_a + leg_b[0]['gamma'] * sz_b
-        convexity   = (long_gamma / short_gamma) if short_gamma > 0 else 0.0
-
-        # Annualised yield on the campaign allocation
-        ann_yield = (total_credit / scale) * (365 / target_dte) * 100 if scale > 0 and total_credit > 0 else 0.0
-
-        conv_ok        = convexity >= 1.0
-        yield_hard_ok  = ann_yield >= YIELD_BLOCK_PCT
-        yield_caution  = yield_hard_ok and ann_yield < YIELD_CAUTION_PCT
-
-        if conv_ok:
-            conv_icon = "✅"
-        else:
-            conv_icon = "❌"
-
-        if ann_yield < YIELD_BLOCK_PCT:
-            yield_icon = "❌"
-        elif ann_yield < YIELD_CAUTION_PCT:
-            yield_icon = "⚠️"
-        else:
-            yield_icon = "✅"
+        ann_yield     = (total_credit / scale) * (365 / target_dte) * 100 if scale > 0 and total_credit > 0 else 0.0
+        yield_hard_ok = ann_yield >= YIELD_BLOCK_PCT
+        yield_caution = yield_hard_ok and ann_yield < YIELD_CAUTION_PCT
+        yield_icon    = "✅" if ann_yield >= YIELD_CAUTION_PCT else ("⚠️" if yield_hard_ok else "❌")
 
         report.append("\n*Structure Checks:*")
-        report.append(f"  Convexity Ly/Sy  = {convexity:.2f}  {conv_icon}  (target > 1.0)")
-        report.append(f"  Annual yield     = {ann_yield:.1f}%  {yield_icon}  "
-                      f"(block < {YIELD_BLOCK_PCT:.0f}%  caution < {YIELD_CAUTION_PCT:.0f}%)")
+        report.append(
+            f"  Annual yield = {ann_yield:.1f}%  {yield_icon}  "
+            f"(block < {YIELD_BLOCK_PCT:.0f}%  caution < {YIELD_CAUTION_PCT:.0f}%)"
+        )
 
         # ── Readiness block ───────────────────────────────────────────────────
         report.append(f"\n*Market Readiness: {readiness['emoji']} {readiness['level']}*")
@@ -954,15 +1124,17 @@ async def suggest_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 report.append(f"  ⚠️ {r}")
         if readiness["spot_move_24h"] is not None:
             report.append(f"  24h spot move: {readiness['spot_move_24h']:.1f}%")
+        if iv_premium is not None:
+            report.append(f"  IV premium: {iv_premium:+.1f} pts (DVOL − 30d RV)")
 
         # ── Gate summary ──────────────────────────────────────────────────────
         hard_blocks = []
         if total_credit < 0:
             hard_blocks.append("Net debit — adjust strikes or sizing")
-        if not conv_ok:
-            hard_blocks.append(f"Convexity {convexity:.2f} < 1.0 — size hedges larger or move them closer to spot")
         if not yield_hard_ok:
-            hard_blocks.append(f"Annualised yield {ann_yield:.1f}% < {YIELD_BLOCK_PCT:.0f}% — premium too thin for the risk")
+            hard_blocks.append(
+                f"Annualised yield {ann_yield:.1f}% < {YIELD_BLOCK_PCT:.0f}% — premium too thin for the risk"
+            )
 
         can_initiate = len(hard_blocks) == 0
 
@@ -970,24 +1142,37 @@ async def suggest_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             report.append("\n❌ *Cannot initiate — fix the following:*")
             for b in hard_blocks:
                 report.append(f"  • {b}")
+        elif is_topup:
+            report.append("\n🔼 *Top-up ready.* Adds remaining 50% to existing campaign legs.")
+        elif readiness["half_size"]:
+            report.append(
+                f"\n⚡ *Half-size entry (50%).* IV rank is low but premium is attractive.\n"
+                f"  Run /suggest again when IV rank > 20% to top up to full size."
+            )
         elif yield_caution or readiness["level"] == "CAUTION":
             report.append("\n⚠️ *Proceed with caution.* Pre-flight check runs before any order is placed.")
         else:
             report.append("\n✅ *Structure looks good.* Pre-flight check runs before any order is placed.")
 
+        # Store suggestion for the confirm step
         context.user_data["last_suggestion"] = {
-            "leg_a": leg_a[0]['instrument'],
-            "leg_b": leg_b[0]['instrument'],
-            "leg_c": leg_c[0]['instrument'],
-            "leg_d": leg_d[0]['instrument'],
-            "scale": scale,
-            "slot":  open_slot,
+            "leg_a":          leg_a[0]['instrument'],
+            "leg_b":          leg_b[0]['instrument'],
+            "leg_c":          leg_c[0]['instrument'],
+            "leg_d":          leg_d[0]['instrument'],
+            "scale":          scale,
+            "scale_pct":      50 if scale_factor == 0.5 else 100,
+            "slot":           target_slot,
+            "topup":          is_topup,
+            "topup_campaign": cam_name if is_topup else None,
         }
 
-        keyboard = [[InlineKeyboardButton(
-            f"🚀 Initiate Slot {open_slot['number']} – {open_slot['label']}",
-            callback_data="init_airs"
-        )]] if can_initiate else None
+        btn_label = (
+            f"🔼 Top-Up Slot {target_slot['number']} – {target_slot['label']}"
+            if is_topup else
+            f"🚀 Initiate Slot {target_slot['number']} – {target_slot['label']}"
+        )
+        keyboard = [[InlineKeyboardButton(btn_label, callback_data="init_airs")]] if can_initiate else None
         await update.message.reply_text(
             "\n".join(report), parse_mode='Markdown',
             reply_markup=InlineKeyboardMarkup(keyboard) if keyboard else None
@@ -995,6 +1180,129 @@ async def suggest_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"Error finding suggestions: {e}")
         await update.message.reply_text(f"❌ Error finding suggestions: {e}")
+
+
+async def _run_airs_execution(query, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Execute pending AIRS legs in two spread pairs.
+
+    Pair 1 (call spread D+A) runs first, then pair 2 (put spread C+B).
+    On any leg failure the user is offered Retry (fresh price) or Open Manually
+    (skip auto-execution; bot shows the /tag command to record it later).
+    No rollback of already-filled legs.
+    """
+    pending = context.user_data.get("pending_airs")
+    if not pending:
+        await query.edit_message_text("❌ Session expired. Run /suggest again.")
+        return
+
+    trades        = pending["trades"]
+    exec_prices   = pending["exec_prices"]
+    campaign_name = pending["campaign"]
+    filled        = pending.setdefault("filled", [])
+    skipped       = pending.setdefault("skipped", [])
+    done_set      = {f["instr"] for f in filled} | {s["instr"] for s in skipped}
+
+    try:
+        await deribit_client.authenticate()
+    except Exception as e:
+        await query.edit_message_text(f"❌ Authentication failed: {e}")
+        return
+
+    pair_labels = ["📞 Call spread (D + A)", "📉 Put spread (C + B)"]
+    for pair_idx, pair_trades in enumerate(_get_airs_pairs(trades)):
+        for t in pair_trades:
+            if t["instr"] in done_set:
+                continue
+
+            price = exec_prices.get(t["instr"])
+            try:
+                if t["side"] == "buy":
+                    res = await deribit_client.buy(t["instr"], t["amount"], price=price, order_type="limit")
+                else:
+                    res = await deribit_client.sell(t["instr"], t["amount"], price=price, order_type="limit")
+
+                order = res.get("order", {})
+                filled.append({
+                    "instr":    t["instr"],
+                    "role":     t["role"],
+                    "side":     t["side"],
+                    "amount":   t["amount"],
+                    "order_id": order.get("order_id"),
+                    "state":    order.get("order_state", "open"),
+                    "price":    order.get("average_price", price),
+                })
+                done_set.add(t["instr"])
+
+            except Exception as e:
+                pending["failed_leg"] = {
+                    "instr":  t["instr"],
+                    "role":   t["role"],
+                    "side":   t["side"],
+                    "amount": t["amount"],
+                    "error":  str(e),
+                }
+                context.user_data["pending_airs"] = pending
+
+                role_label = ROLE_LABELS.get(t["role"], t["role"])
+                lines = [
+                    f"❌ *Leg failed:* [{role_label}] `{t['instr']}`\n  └ {e}\n",
+                    f"*{pair_labels[pair_idx]}* — in progress",
+                ]
+                if filled:
+                    lines.append("\n*Already filled:*")
+                    for f in filled:
+                        rl = ROLE_LABELS.get(f["role"], f["role"])
+                        lines.append(f"  ✅ [{rl}] {f['instr']}  (order {f['order_id']})")
+                lines.append(
+                    "\n_Retry fetches a fresh market price. "
+                    "'Open Manually' skips auto-execution — open it yourself, then use /tag to record it._"
+                )
+                keyboard = [[
+                    InlineKeyboardButton("🔄 Retry",         callback_data="airs_retry_leg"),
+                    InlineKeyboardButton("✋ Open Manually", callback_data="airs_skip_leg"),
+                    InlineKeyboardButton("❌ Abort",          callback_data="init_airs_cancel"),
+                ]]
+                await query.edit_message_text(
+                    "\n".join(lines), parse_mode='Markdown',
+                    reply_markup=InlineKeyboardMarkup(keyboard),
+                )
+                return
+
+    # ── All legs handled — tag and report ─────────────────────────────────────
+    is_topup       = pending.get("topup", False)
+    topup_campaign = pending.get("topup_campaign")
+    scale_pct      = pending.get("scale_pct", 100)
+    final_campaign = topup_campaign if is_topup else campaign_name
+
+    summary = [
+        f"🔼 *AIRS Top-Up — {topup_campaign}*\n" if is_topup else f"🚀 *AIRS Campaign ({campaign_name})*\n"
+    ]
+    for f in filled:
+        role_label = ROLE_LABELS.get(f["role"], f["role"])
+        summary.append(f"✅ *[{role_label}]* {f['instr']}\n  └ Price: {f['price']} | ID: {f['order_id']}")
+        if not is_topup:
+            tag_instrument(f["instr"], f["role"], campaign_name)
+
+    set_campaign_scale_pct(final_campaign, 100.0 if is_topup else float(scale_pct))
+
+    if skipped:
+        summary.append("\n*Open manually (not auto-tagged):*")
+        for s in skipped:
+            rl = ROLE_LABELS.get(s["role"], s["role"])
+            summary.append(
+                f"✋ *[{rl}]* {s['instr']}\n"
+                f"  └ `/tag {s['instr']} {s['role']} {final_campaign}`"
+            )
+
+    if is_topup:
+        summary.append(f"\n✅ *{topup_campaign}* topped up to 100% — full campaign now active.")
+    elif scale_pct < 100:
+        summary.append(
+            f"\n⚡ *Half-size campaign initiated ({scale_pct:.0f}%).*\n"
+            f"  Run /suggest when IV rank > 20% to top up to full size."
+        )
+    summary.append("\n_Use /tag to re-assign legs or add to a different campaign._")
+    await query.edit_message_text("\n".join(summary), parse_mode='Markdown')
 
 
 # ── Button handler ─────────────────────────────────────────────────────────────
@@ -1042,9 +1350,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             # Store the resolved trade plan for the confirm step
             context.user_data["pending_airs"] = {
-                "trades": trades,
-                "exec_prices": exec_prices,
-                "campaign": _instr_campaign_name(trades[0]["instr"]),
+                "trades":          trades,
+                "exec_prices":     exec_prices,
+                "campaign":        _instr_campaign_name(trades[0]["instr"]),
+                "scale_pct":       suggestion.get("scale_pct", 100),
+                "topup":           suggestion.get("topup", False),
+                "topup_campaign":  suggestion.get("topup_campaign"),
             }
 
             if has_no_market:
@@ -1058,7 +1369,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     lines.append("\n⚠️ *Wide spreads detected — fills may be poor.*")
                 else:
                     lines.append("\n✅ *Spreads look good.*")
-                lines.append("_Legs execute sequentially. If any leg fails, filled legs are rolled back._")
+                lines.append("_Legs execute in two pairs (call spread D+A first, then put spread C+B). If a leg fails you can retry or open it manually — no rollback._")
                 keyboard = [[
                     InlineKeyboardButton("🚀 Confirm", callback_data="init_airs_confirm"),
                     InlineKeyboardButton("❌ Cancel",  callback_data="init_airs_cancel"),
@@ -1073,85 +1384,64 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "init_airs_confirm":
-        # ── Step 2: Sequential execution with rollback ─────────────────────────
+        # ── Step 2: Kick off pair-by-pair execution ────────────────────────────
         pending = context.user_data.get("pending_airs")
         if not pending:
             await query.edit_message_text("❌ Session expired. Run /suggest again.")
             return
-
-        trades       = pending["trades"]
-        exec_prices  = pending["exec_prices"]
-        campaign_name = pending["campaign"]
-        await query.edit_message_text("⏳ Executing legs sequentially...")
-
-        filled = []  # legs that placed successfully — needed for rollback
-        failed_leg = None
-
-        try:
-            await deribit_client.authenticate()
-            for t in trades:
-                price = exec_prices.get(t["instr"])
-                try:
-                    if t["side"] == "buy":
-                        res = await deribit_client.buy(t["instr"], t["amount"], price=price, order_type="limit")
-                    else:
-                        res = await deribit_client.sell(t["instr"], t["amount"], price=price, order_type="limit")
-                    order = res.get("order", {})
-                    filled.append({
-                        "instr":    t["instr"],
-                        "role":     t["role"],
-                        "side":     t["side"],
-                        "amount":   t["amount"],
-                        "order_id": order.get("order_id"),
-                        "state":    order.get("order_state", "open"),
-                        "price":    order.get("average_price", price),
-                    })
-                except Exception as e:
-                    failed_leg = {"instr": t["instr"], "error": str(e)}
-                    break
-
-            if failed_leg:
-                # ── Rollback ───────────────────────────────────────────────────
-                rb_lines = [
-                    f"❌ *Leg failed:* {failed_leg['instr']}\n  └ {failed_leg['error']}\n",
-                    f"⏪ Rolling back {len(filled)} filled leg(s)...",
-                ]
-                for f in filled:
-                    try:
-                        if f["state"] in ("open", "untriggered"):
-                            await deribit_client.cancel_order(f["order_id"])
-                            rb_lines.append(f"✅ Cancelled order for {f['instr']}")
-                        else:
-                            # Position filled — reverse it
-                            ticker = await deribit_client.get_ticker(f["instr"])
-                            if f["side"] == "buy":
-                                price = ticker.get("best_bid_price") or ticker.get("last_price")
-                                await deribit_client.sell(f["instr"], f["amount"], price=price, order_type="limit")
-                            else:
-                                price = ticker.get("best_ask_price") or ticker.get("last_price")
-                                await deribit_client.buy(f["instr"], f["amount"], price=price, order_type="limit")
-                            rb_lines.append(f"✅ Closed position in {f['instr']}")
-                    except Exception as re:
-                        rb_lines.append(f"⚠️ Rollback failed for {f['instr']}: {re}\n  → Close manually with /close {f['instr']}")
-                await query.edit_message_text("\n".join(rb_lines), parse_mode='Markdown')
-                return
-
-            # ── All legs filled — tag and report ──────────────────────────────
-            summary = [f"🚀 *AIRS Campaign ({campaign_name})*\n"]
-            for f in filled:
-                role_label = ROLE_LABELS.get(f["role"], f["role"])
-                summary.append(f"✅ *[{role_label}]* {f['instr']}\n  └ Price: {f['price']} | ID: {f['order_id']}")
-                tag_instrument(f["instr"], f["role"], campaign_name)
-            summary.append("\n_Use /tag to re-assign legs or add to a different campaign._")
-            await query.edit_message_text("\n".join(summary), parse_mode='Markdown')
-
-        except Exception as e:
-            await query.edit_message_text(f"❌ Critical error during execution: {e}")
+        pending["filled"]  = []
+        pending["skipped"] = []
+        context.user_data["pending_airs"] = pending
+        await query.edit_message_text("⏳ Executing call spread (D + A)...")
+        await _run_airs_execution(query, context)
         return
 
     if data == "init_airs_cancel":
         context.user_data.pop("pending_airs", None)
         await query.edit_message_text("❌ Execution cancelled.")
+        return
+
+    if data == "airs_retry_leg":
+        # ── Retry failed leg at a fresh market price ───────────────────────────
+        pending = context.user_data.get("pending_airs")
+        if not pending or "failed_leg" not in pending:
+            await query.edit_message_text("❌ No pending retry. Run /suggest again.")
+            return
+        failed = pending["failed_leg"]
+        try:
+            await deribit_client.authenticate()
+            ticker = await deribit_client.get_ticker(failed["instr"])
+            fresh_price = (
+                ticker.get("best_ask_price") if failed["side"] == "buy"
+                else ticker.get("best_bid_price")
+            ) or ticker.get("last_price", 0)
+            pending["exec_prices"][failed["instr"]] = fresh_price
+            del pending["failed_leg"]
+            context.user_data["pending_airs"] = pending
+        except Exception as e:
+            await query.edit_message_text(f"❌ Could not fetch fresh price: {e}")
+            return
+        await query.edit_message_text("🔄 Retrying leg at fresh market price...")
+        await _run_airs_execution(query, context)
+        return
+
+    if data == "airs_skip_leg":
+        # ── Mark failed leg as manually opened; continue execution ────────────
+        pending = context.user_data.get("pending_airs")
+        if not pending or "failed_leg" not in pending:
+            await query.edit_message_text("❌ No pending leg to skip. Run /suggest again.")
+            return
+        failed = pending["failed_leg"]
+        pending.setdefault("skipped", []).append({
+            "instr":  failed["instr"],
+            "role":   failed["role"],
+            "side":   failed["side"],
+            "amount": failed["amount"],
+        })
+        del pending["failed_leg"]
+        context.user_data["pending_airs"] = pending
+        await query.edit_message_text("✋ Leg skipped — open it yourself, then /tag it. Continuing...")
+        await _run_airs_execution(query, context)
         return
 
     if data == "take_free":
