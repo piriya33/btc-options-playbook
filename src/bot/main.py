@@ -137,6 +137,23 @@ def _slot_for_dte(dte: int | None) -> int | None:
     return None
 
 
+def _parse_slot_arg(args: list[str]) -> dict | None:
+    """Resolve `/suggest <slot>` argument to a CAMPAIGN_SLOTS entry.
+
+    Accepts slot label (harvest/core/far, case-insensitive) or slot number (1/2/3).
+    Returns None when no arg given. Raises ValueError on unrecognised input.
+    """
+    if not args:
+        return None
+    token = args[0].strip().lower()
+    for slot in CAMPAIGN_SLOTS:
+        if token == slot["label"].lower() or token == str(slot["number"]):
+            return slot
+    raise ValueError(
+        f"Unknown slot '{args[0]}'. Use: harvest | core | far  (or 1 | 2 | 3)."
+    )
+
+
 def _filled_slots(campaigns: list) -> dict:
     """
     Return {slot_number: {"name": ..., "dte": ..., "scale_pct": ...}} for each
@@ -390,7 +407,8 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "<b>── Market ──</b>\n"
         "/morning — Full AIRS morning briefing (positions + directives)\n"
         "/status — Live portfolio snapshot\n"
-        "/suggest — Find next AIRS campaign slot + pre-trade gates\n"
+        "/suggest [slot] — Find next AIRS slot + pre-trade gates (auto-picks if no slot)\n"
+        "  Force a slot: <code>/suggest harvest|core|far</code> (or <code>1|2|3</code>)\n"
         "/iv — Volatility intelligence (DVOL, IV rank 30d/1y, RV, premium)\n"
         "/fear_greed — Bitcoin Fear &amp; Greed index\n"
         "\n"
@@ -862,7 +880,18 @@ async def close_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def suggest_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Analysing campaign slots and finding best instruments... 🔍")
+    try:
+        forced_slot = _parse_slot_arg(context.args)
+    except ValueError as e:
+        await update.message.reply_text(f"❌ {e}")
+        return
+
+    if forced_slot:
+        await update.message.reply_text(
+            f"Analysing Slot {forced_slot['number']} – {forced_slot['label']}... 🎯"
+        )
+    else:
+        await update.message.reply_text("Analysing campaign slots and finding best instruments... 🔍")
     try:
         await deribit_client.authenticate()
         summary    = await deribit_client.get_account_summary()
@@ -906,13 +935,24 @@ async def suggest_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         existing  = get_all_open_campaigns()
         filled    = _filled_slots(existing)
 
-        # Half-filled slot takes priority (top up before opening a new one)
-        half_slot = next(
-            (s for s in CAMPAIGN_SLOTS if s["number"] in filled and filled[s["number"]]["scale_pct"] < 100),
-            None,
-        )
-        open_slot = next((s for s in CAMPAIGN_SLOTS if s["number"] not in filled), None)
-        target_slot = half_slot or open_slot
+        if forced_slot:
+            forced_info = filled.get(forced_slot["number"])
+            if forced_info and forced_info["scale_pct"] >= 100:
+                await update.message.reply_text(
+                    f"✅ Slot {forced_slot['number']} ({forced_slot['label']}) is already at 100% "
+                    f"— {forced_info['name']} ({forced_info['dte']} DTE). Nothing to do here."
+                )
+                return
+            target_slot = forced_slot
+            half_slot   = forced_slot if forced_info else None
+        else:
+            # Half-filled slot takes priority (top up before opening a new one)
+            half_slot = next(
+                (s for s in CAMPAIGN_SLOTS if s["number"] in filled and filled[s["number"]]["scale_pct"] < 100),
+                None,
+            )
+            open_slot = next((s for s in CAMPAIGN_SLOTS if s["number"] not in filled), None)
+            target_slot = half_slot or open_slot
 
         if target_slot is None:
             slot_lines = "\n".join(
@@ -964,9 +1004,13 @@ async def suggest_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             leg_c = [await _ticker_leg(role_to_instr["crash_hedge"])]
             leg_d = [await _ticker_leg(role_to_instr["moon_hedge"])]
         else:
-            # Try open slots in order; skip any that have no liquid expiry right now
+            # Try open slots in order; skip any that have no liquid expiry right now.
+            # When a slot is forced, the candidate list is just that one slot.
             skipped_slots: list[str] = []
-            open_candidates = [s for s in CAMPAIGN_SLOTS if s["number"] not in filled]
+            if forced_slot:
+                open_candidates = [forced_slot]
+            else:
+                open_candidates = [s for s in CAMPAIGN_SLOTS if s["number"] not in filled]
             leg_a = leg_b = leg_c = leg_d = []
             for candidate in open_candidates:
                 la = await deribit_client.find_instruments_by_delta(
@@ -987,11 +1031,18 @@ async def suggest_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
 
             if not leg_a:
-                skipped = ", ".join(skipped_slots) or "all slots"
-                await update.message.reply_text(
-                    f"❌ No liquid instruments found across any open slot ({skipped}).\n"
-                    f"Deribit may have no active expiries in range right now — try again tomorrow.",
-                )
+                if forced_slot:
+                    await update.message.reply_text(
+                        f"❌ No liquid instruments at Slot {forced_slot['number']} "
+                        f"({forced_slot['label']}, {forced_slot['dte_min']}–{forced_slot['dte_max']} DTE).\n"
+                        f"Deribit may have no active expiries in that range right now."
+                    )
+                else:
+                    skipped = ", ".join(skipped_slots) or "all slots"
+                    await update.message.reply_text(
+                        f"❌ No liquid instruments found across any open slot ({skipped}).\n"
+                        f"Deribit may have no active expiries in range right now — try again tomorrow.",
+                    )
                 return
 
         # ── Sizing ────────────────────────────────────────────────────────────
@@ -1062,13 +1113,14 @@ async def suggest_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 slot_lines.append(f"  Slot {s['number']} – {s['label']}: ⬜ Empty")
 
+        forced_tag = "  🎯 _forced_" if forced_slot else ""
         if is_topup:
             size_note = (
                 f"⚖️ Top-up allocation: {scale} BTC  "
                 f"(adding remaining 50% to {cam_info['name']})"
             )
             header = (
-                f"🔼 *AIRS Top-Up — Slot {target_slot['number']}: {target_slot['label']}*\n"
+                f"🔼 *AIRS Top-Up — Slot {target_slot['number']}: {target_slot['label']}*{forced_tag}\n"
                 f"Campaign: {cam_info['name']}  ({cam_info['dte']} DTE remaining)\n"
             )
         else:
@@ -1078,7 +1130,7 @@ async def suggest_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"{' × 0.5' if scale_factor == 0.5 else ''})"
             )
             header = (
-                f"🚀 *AIRS Suggestion — Slot {target_slot['number']}: {target_slot['label']}*\n"
+                f"🚀 *AIRS Suggestion — Slot {target_slot['number']}: {target_slot['label']}*{forced_tag}\n"
                 f"Target: ~{target_dte} DTE\n"
             )
 
