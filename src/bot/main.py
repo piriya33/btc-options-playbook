@@ -35,6 +35,9 @@ from database.queries import (
     clear_harvest_alerted,
     get_campaign_scale_pct,
     set_campaign_scale_pct,
+    get_ignored_instruments,
+    set_ignored_instrument,
+    clear_ignored_instrument,
 )
 from database.ingest_dvol import ensure_dvol_history, ingest_yesterday_dvol
 
@@ -267,6 +270,9 @@ async def _fetch_data():
     account_summary = await deribit_client.get_account_summary()
     iv_data         = get_iv_ranks(current_dvol)
     initial_equity  = get_initial_btc_equity()
+    ignored         = get_ignored_instruments()
+    if ignored:
+        positions = [p for p in positions if p.get("instrument_name") not in ignored]
     return spot_price, positions, account_summary, iv_data, initial_equity
 
 
@@ -428,6 +434,9 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "<code>C</code>=crash_hedge  <code>D</code>=moon_hedge\n"
         "  Example: <code>/tag BTC-27JUN25-100000-C A MAY2026</code>\n"
         "/untag &lt;instrument&gt; — Remove a tag\n"
+        "/ignore &lt;instrument&gt; — Exclude from charts and PnL (let worthless positions expire quietly)\n"
+        "/ignore — List currently ignored instruments\n"
+        "/unignore &lt;instrument&gt; — Restore an ignored instrument\n"
         "\n"
         "<b>── Settings ──</b>\n"
         "/register — Subscribe to daily 08:00 UTC morning briefing\n"
@@ -573,6 +582,38 @@ async def untag_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ok, msg = untag_instrument(args[0])
     prefix = "✅" if ok else "❌"
     await update.message.reply_text(f"{prefix} {msg}")  # plain text — no parse_mode
+
+
+async def ignore_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/ignore <instrument> — exclude from charts and PnL calculations."""
+    if not context.args:
+        ignored = get_ignored_instruments()
+        if not ignored:
+            await update.message.reply_text("No instruments are currently ignored.")
+        else:
+            lines = "\n".join(f"  • {i}" for i in sorted(ignored))
+            await update.message.reply_text(f"Ignored instruments:\n{lines}")
+        return
+    name = context.args[0].upper()
+    set_ignored_instrument(name)
+    await update.message.reply_text(
+        f"✅ {name} is now ignored — excluded from charts and PnL calculations.\n"
+        f"Use /unignore {name} to restore it."
+    )
+
+
+async def unignore_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/unignore <instrument> — restore a previously ignored instrument."""
+    if not context.args:
+        await update.message.reply_text("Usage: /unignore <instrument>")
+        return
+    name = context.args[0].upper()
+    ignored = get_ignored_instruments()
+    if name not in ignored:
+        await update.message.reply_text(f"❌ {name} is not in the ignored list.")
+        return
+    clear_ignored_instrument(name)
+    await update.message.reply_text(f"✅ {name} restored — will appear in charts and calculations again.")
 
 
 async def campaigns_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1761,6 +1802,8 @@ def main():
     application.add_handler(CommandHandler("status",     status))
     application.add_handler(CommandHandler("tag",        tag_cmd))
     application.add_handler(CommandHandler("untag",      untag_cmd))
+    application.add_handler(CommandHandler("ignore",     ignore_cmd))
+    application.add_handler(CommandHandler("unignore",   unignore_cmd))
     application.add_handler(CommandHandler("campaigns",  campaigns_cmd))
     application.add_handler(CommandHandler("legs",       legs_cmd))
     application.add_handler(CommandHandler("recycle",    recycle_cmd))

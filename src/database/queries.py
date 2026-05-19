@@ -375,3 +375,70 @@ def clear_harvest_alerted(instrument_name: str):
             db.commit()
     finally:
         db.close()
+
+
+# ── Ignored instruments ───────────────────────────────────────────────────────
+# Positions marked ignored are excluded from charts and PnL calculations.
+# Stored as AppSettings rows: key "ignored:<instrument_name>" → value 1.0.
+
+def get_ignored_instruments() -> set:
+    """Return the set of instrument names currently marked as ignored."""
+    db = SessionLocal()
+    try:
+        rows = db.query(AppSettings).filter(AppSettings.key.like('ignored:%')).all()
+        return {r.key[len('ignored:'):] for r in rows}
+    finally:
+        db.close()
+
+
+def set_ignored_instrument(name: str):
+    """Mark an instrument as ignored in calculations and charts."""
+    db = SessionLocal()
+    try:
+        key = f"ignored:{name}"
+        if not db.query(AppSettings).filter(AppSettings.key == key).first():
+            db.add(AppSettings(key=key, value=1.0))
+            db.commit()
+    finally:
+        db.close()
+
+
+def clear_ignored_instrument(name: str):
+    """Remove an instrument from the ignored list."""
+    db = SessionLocal()
+    try:
+        key = f"ignored:{name}"
+        row = db.query(AppSettings).filter(AppSettings.key == key).first()
+        if row:
+            db.delete(row)
+            db.commit()
+    finally:
+        db.close()
+
+
+# ── Campaign scale tracking ────────────────────────────────────────────────────
+
+def set_campaign_scale_pct(campaign_name: str, pct: float):
+    """Persist the deployed scale percentage for a campaign (50 or 100)."""
+    db = SessionLocal()
+    try:
+        key = f"campaign_scale:{campaign_name}"
+        setting = db.query(AppSettings).filter(AppSettings.key == key).first()
+        if setting:
+            setting.value = float(pct)
+        else:
+            db.add(AppSettings(key=key, value=float(pct)))
+        db.commit()
+    finally:
+        db.close()
+
+
+def get_campaign_scale_pct(campaign_name: str) -> float:
+    """Return the deployed scale percentage for a campaign (default 100)."""
+    db = SessionLocal()
+    try:
+        key = f"campaign_scale:{campaign_name}"
+        setting = db.query(AppSettings).filter(AppSettings.key == key).first()
+        return setting.value if setting else 100.0
+    finally:
+        db.close()
