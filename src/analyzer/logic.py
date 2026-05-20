@@ -159,17 +159,17 @@ class AIRSAnalyzer:
         b = by_role["yield_put"]["size"]
         c = by_role["crash_hedge"]["size"]
         a = by_role["yield_call"]["size"]
-        long_g  = by_role["crash_hedge"]["gamma"] + by_role["moon_hedge"]["gamma"]
-        short_g = abs(by_role["yield_call"]["gamma"] + by_role["yield_put"]["gamma"])
+        long_contracts  = by_role["crash_hedge"]["size"] + by_role["moon_hedge"]["size"]
+        short_contracts = by_role["yield_call"]["size"]  + by_role["yield_put"]["size"]
 
         put_ratio  = (c / b) if b > 0 else (99.0 if c > 0 else 0.0)
         call_floor = (a / equity_btc) if equity_btc > 0 else 0.0
-        convexity  = (long_g / short_g) if short_g > 0 else (99.0 if long_g > 0 else 0.0)
+        convexity  = (long_contracts / short_contracts) if short_contracts > 0 else (99.0 if long_contracts > 0 else 0.0)
 
         return {
-            "put_ratio":  {"value": round(put_ratio, 2),  "label": "Put ratio  C:B", "target": "≥ 3.0", "ok": put_ratio >= 3.0},
-            "call_floor": {"value": round(call_floor, 2), "label": "Call floor A/Eq","target": "≤ 1.0", "ok": call_floor <= 1.0},
-            "convexity":  {"value": round(convexity, 2),  "label": "Convexity Lγ/Sγ","target": "> 1.0", "ok": convexity > 1.0},
+            "put_ratio":  {"value": round(put_ratio, 2),  "label": "Put ratio  C:B",  "target": "≥ 3.0", "ok": put_ratio >= 3.0},
+            "call_floor": {"value": round(call_floor, 2), "label": "Call floor A/Eq", "target": "≤ 1.0", "ok": call_floor <= 1.0},
+            "convexity":  {"value": round(convexity, 2),  "label": "Convexity L/S",   "target": "> 1.0", "ok": convexity > 1.0},
             "margin":     {"value": round(margin_pct, 1), "label": "Margin util",     "target": "≤ 25%", "ok": margin_pct <= 25.0},
         }
 
