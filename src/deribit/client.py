@@ -151,7 +151,19 @@ class DeribitClient:
     async def cancel_order(self, order_id: str) -> Dict[str, Any]:
         return await self._post("private/cancel", {"order_id": order_id})
 
-    async def find_instruments_by_delta(self, target_delta: float, target_dte: int = 30, opt_type: str = "C") -> list:
+    async def find_instruments_by_delta(
+        self,
+        target_delta: float,
+        target_dte: int = 30,
+        opt_type: str = "C",
+        dte_min: int | None = None,
+        dte_max: int | None = None,
+    ) -> list:
+        """Find options near target_delta.
+
+        DTE filter: if dte_min/dte_max are provided, use that range exactly.
+        Otherwise fall back to target_dte ± 10 days.
+        """
         spot = await self.get_btc_spot_price()
         instruments = await self._get("public/get_instruments", {"currency": "BTC", "kind": "option"})
 
@@ -164,19 +176,26 @@ class DeribitClient:
             try:
                 expiry = datetime.strptime(parts[1], "%d%b%y")
                 dte = (expiry - datetime.now(UTC).replace(tzinfo=None)).days
-                if abs(dte - target_dte) <= 10:
+                if dte_min is not None and dte_max is not None:
+                    in_range = dte_min <= dte <= dte_max
+                else:
+                    in_range = abs(dte - target_dte) <= 10
+                if in_range:
                     strike = float(parts[2])
                     if opt_type == "C" and strike > spot:
-                        matches.append((name, strike))
+                        matches.append((name, strike, dte))
                     elif opt_type == "P" and strike < spot:
-                        matches.append((name, strike))
+                        matches.append((name, strike, dte))
             except Exception:
                 continue
+
+        # Prefer expiries closest to target_dte within the range
+        matches.sort(key=lambda x: (abs(x[2] - target_dte), abs(x[1] - spot)))
 
         matches.sort(key=lambda x: abs(x[1] - spot))
 
         results = []
-        for name, strike in matches[:50]:
+        for name, strike, _dte in matches[:50]:
             ticker = await self._get("public/ticker", {"instrument_name": name})
             greeks = ticker.get("greeks", {})
             delta  = greeks.get("delta", 0)
